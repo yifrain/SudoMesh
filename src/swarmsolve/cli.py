@@ -469,21 +469,26 @@ def peer(
     node_delay: float = typer.Option(0.0, help="Artificial per-node cost (demo)"),
     split_depth: int = typer.Option(0, help="Work-stealing depth (0 = off)"),
     lease: float = typer.Option(10.0, help="Task lease seconds"),
+    idle_limit: int = typer.Option(30, help="Idle polls before giving up (higher = wait longer for tasks)"),
 ) -> None:
     """Launch one real peer (use several terminals / machines for a live demo)."""
     board = load_board(file)
 
     async def main() -> None:
         p = Peer("0.0.0.0", port, board, log=console.print,
-                 node_delay=node_delay, split_depth=split_depth, lease_seconds=lease)
+                 node_delay=node_delay, split_depth=split_depth, lease_seconds=lease,
+                 idle_limit=idle_limit)
         boot = None
         if bootstrap:
             host, bport = bootstrap.split(":")
             boot = [Contact(NodeID.from_string(f"{host}:{int(bport)}"), host, int(bport))]
         await p.start(boot)
-        await asyncio.sleep(1.0)
         if submit:
+            await asyncio.sleep(2.0)     # let joiners bootstrap
             await p.submit(tasks)
+            await asyncio.sleep(1.0)     # let gossip propagate to joiners
+        else:
+            await asyncio.sleep(1.0)
         sol = await p.run()
         if sol:
             console.print("[green]Solution:[/]")

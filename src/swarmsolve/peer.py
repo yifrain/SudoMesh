@@ -100,12 +100,14 @@ class Peer:
         self._stop = asyncio.Event()
         self.nodes_expanded = 0
         self.tasks_done = 0
+        self._bootstrap_contacts: list[Contact] = []
 
     # ---- lifecycle ----------------------------------------------------
 
     async def start(self, bootstrap: list[Contact] | None = None) -> None:
         await self.transport.start(self._dispatch)
         self.gossip.deliver = self._on_gossip
+        self._bootstrap_contacts = bootstrap or []
         if bootstrap:
             await self.dht.bootstrap(bootstrap)
         self.log(f"[{self.id.short()}] up on {self.host}:{self.port} "
@@ -184,6 +186,13 @@ class Peer:
                 self.solution = Board.from_flat(self.board.n, flat)
                 self.log(f"[{self.id.short()}] received SOLUTION via gossip")
                 self._stop.set()
+                # Forward to ALL known peers so everyone stops quickly
+                relay = Message(
+                    MessageType.SOLUTION, self.id.hex(),
+                    msg.payload, msg_id=msg.msg_id, ttl=3, ts=msg.ts,
+                )
+                for c in self.dht.table.all_contacts():
+                    await self.transport.send_tcp(c.host, c.port, relay)
 
     # ---- task production (submitter only) -----------------------------
 
@@ -276,17 +285,29 @@ class Peer:
         gives a crashed peer's lease time to expire so its task is reclaimed.
         """
         idle_rounds = 0
+        self.log(f"[{self.id.short()}] waiting for tasks...")
         while not self._stop.is_set():
             self._maybe_tick()                      # refresh the live dashboard
             task = self._pick_task()                # closest-to-me, owner-filtered
             if task is None:
                 idle_rounds += 1
+                if idle_rounds == 1:
+                    self.log(f"[{self.id.short()}] idle, waiting for tasks...")
+                # Re-bootstrap every ~1s: submitter may have just started
+                if self._bootstrap_contacts and idle_rounds % 30 == 0:
+                    self.log(f"[{self.id.short()}] re-bootstrapping to find submitter...")
+                    await self.dht.bootstrap(self._bootstrap_contacts)
                 if idle_rounds > self.idle_limit:   # quiescent -> we're done
+                    self.log(f"[{self.id.short()}] no tasks after {self.idle_limit} polls, exiting")
                     break
                 await asyncio.sleep(0.03)           # wait for tasks to arrive
                 continue
             idle_rounds = 0
+            self.log(f"[{self.id.short()}] claiming task (depth={task.depth}, "
+                     f"nodes_so_far={self.nodes_expanded})")
             await self._work_on(task)               # claim -> split/solve -> gossip
+        self.log(f"[{self.id.short()}] stopping (nodes={self.nodes_expanded}, "
+                 f"tasks_done={self.tasks_done})")
         return self.solution
 
     async def _work_on(self, task: Task) -> None:

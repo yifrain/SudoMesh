@@ -116,7 +116,7 @@ Only the `solver/` package changes; transport/discovery/gossip/tasks stay.
 ## 6. Tech stack & layout
 
 * **Language**: Python 3.11+, `asyncio` for concurrency.
-* **Package/deps**: [`uv`](https://docs.astral.sh/uv/).
+* **Package/deps**: [`uv`](https://docs.astral.sh/uv/) (recommended) or conda + pip.
 * **CLI / output**: `typer` + `rich`.
 * **Tests**: `pytest`.
 
@@ -139,44 +139,162 @@ SwarmSolve/
 
 ## 7. Quickstart
 
+### Setup
+
+#### Option A: uv (recommended)
+
 ```bash
-# 1. set up the environment
 uv sync --extra dev
-
-# 2. run the tests
-uv run pytest -q
-
-# 3. single-machine baseline
-uv run swarmsolve solve examples/puzzles/hard_9x9.txt
-
-# 4. generate a bigger puzzle
-uv run swarmsolve gen --size 16 --out puzzle16.txt
-
-# 5. REAL local swarm (separate OS processes over localhost) vs baseline
-uv run swarmsolve demo --file puzzle16.txt --peers 4
-
-# 6. [B] measurable speedup on an exhaustive search (count all solutions)
-uv run swarmsolve benchmark --file examples/puzzles/hard_9x9.txt \
-    --peers 4 --node-delay 0.0012 --split-depth 4
-
-# 7. [A] fault tolerance: kill a peer mid-solve; its task gets reassigned
-uv run swarmsolve fault --file examples/puzzles/hard_9x9.txt --peers 4 --kill-peer 2
-
-# 8. [C] live dashboard of per-peer task counters
-uv run swarmsolve dashboard --file examples/puzzles/hard_9x9.txt --peers 4 --node-delay 0.003
-
-# 9. manual multi-terminal / multi-machine demo
-#    terminal 1 (bootstrap + submitter):
-uv run swarmsolve peer --port 9000 --file puzzle16.txt --submit
-#    terminal 2..n (joiners):
-uv run swarmsolve peer --port 9001 --file puzzle16.txt --bootstrap 127.0.0.1:9000
 ```
 
-All of `demo`/`benchmark`/`fault`/`dashboard` spawn **real OS processes** talking
-over real localhost sockets, so the CPU-bound search runs in parallel. See the
-**code-level docs** in [`docs/`](docs/README.md) for what each command shows.
-Note: first-*solution* search barely parallelizes (the answer sits on one deep
-path), so use `benchmark` (exhaustive search) to see honest near-linear speedup.
+#### Option B: conda + pip
+
+```bash
+conda create -n swarmsolve python=3.12 -y
+conda activate swarmsolve
+pip install -e .
+pip install pytest pytest-asyncio
+```
+
+### Run the tests
+
+```bash
+# uv
+uv run pytest -q
+
+# conda
+pytest -q
+```
+
+> All commands below use `uv run swarmsolve <cmd>`. If you installed via conda/pip,
+> just use `swarmsolve <cmd>` directly.
+
+### Demo commands (for presentations)
+
+All demo commands (`demo`/`benchmark`/`fault`/`dashboard`) spawn **real OS processes**
+talking over real localhost sockets, so the CPU-bound search runs in parallel.
+
+| # | Command | What it demonstrates | Key takeaway |
+|---|---------|---------------------|--------------|
+| 1 | `solve` | Single-machine DFS + constraint propagation | Quick correctness check |
+| 2 | `gen` | Generate puzzles of any size | Prepare input for demos |
+| 3 | `demo` | Single-machine vs P2P swarm comparison | Distributed architecture works |
+| 4 | `benchmark` | Exhaustive search with real speedup | **Near-linear parallel speedup** |
+| 5 | `fault` | Kill a peer mid-solve → task auto-reassigned | **Fault tolerance & lease mechanism** |
+| 6 | `dashboard` | Live per-peer task counters | Real-time load distribution |
+| 7 | `peer` | Manual multi-terminal demo | Interactive live demo |
+
+#### 1. `solve` — single-machine baseline
+
+```bash
+# easy puzzle (constraint propagation handles it, ~0.000s)
+uv run swarmsolve solve examples/puzzles/easy_9x9.txt
+
+# hard puzzle (deep search tree, ~0.3s, 6050+ nodes explored)
+uv run swarmsolve solve examples/puzzles/hard_9x9.txt
+```
+
+Shows the solved board with timing stats (`time`, `nodes`, `dead_ends`).
+
+#### 2. `gen` — generate a puzzle
+
+```bash
+uv run swarmsolve gen --size 16 --out examples/puzzles/puzzle16.txt
+uv run swarmsolve gen --size 25 --out examples/puzzles/puzzle25.txt   # stress-testing
+```
+
+Creates a valid solvable puzzle. **Note**: generated puzzles are solved instantly
+by constraint propagation — for demos that need a deep search tree, always use
+`examples/puzzles/hard_9x9.txt` (hand-crafted, ~6050 nodes explored).
+
+#### 3. `demo` — single-machine vs P2P swarm
+
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4
+```
+
+Shows:
+1. Single-machine baseline timing
+2. Per-peer report: who found the solution, nodes explored, time
+3. Wall-clock comparison
+
+**Note:** First-solution search has limited parallelism (the answer sits on one
+deep path). See `benchmark` below for honest speedup.
+
+#### 4. `benchmark` — exhaustive search with real speedup
+
+```bash
+uv run swarmsolve benchmark --file examples/puzzles/hard_9x9.txt \
+    --peers 4 --node-delay 0.0012 --split-depth 4
+```
+
+Shows **~2× speedup on 4 peers** (wall clock). Explores the *entire* tree (counts
+all solutions), so the workload is embarrassingly parallel. Output verifies:
+"correctness OK: all solutions covered exactly once".
+
+#### 5. `fault` — fault tolerance
+
+```bash
+uv run swarmsolve fault --file examples/puzzles/easy_9x9.txt --peers 4 --kill-peer 2
+```
+
+Peer #2 is killed mid-solve. The swarm **still solves** the puzzle because the
+lease on its task expires and another peer picks it up. Output confirms:
+"swarm STILL solved the puzzle ... despite the failure".
+
+#### 6. `dashboard` — live task counters
+
+```bash
+uv run swarmsolve dashboard --file examples/puzzles/hard_9x9.txt --peers 4 --node-delay 0.003
+```
+
+A live-updating table of per-peer `open` / `claimed` / `dead_ends` / `done` counts,
+showing how tasks flow between peers in real time.
+
+#### 7. `peer` — manual multi-terminal demo
+
+**This is the most interactive demo.** Open 5 terminals side by side and watch
+peers discover each other, claim tasks, and collaborate in real time.
+
+> **Important**: Only use `hard_9x9.txt` for this demo. Generated 16×16/25×25
+> puzzles are solved instantly by constraint propagation — they don't show any
+> peer interaction. `hard_9x9.txt` is a hand-crafted puzzle with ~6050 search
+> nodes, which is what makes the demo visible.
+
+> **Why `--node-delay`?** Even `hard_9x9.txt` solves in ~0.3s without it.
+> `--node-delay 0.01` adds a 10ms pause per search node (~60s total), giving
+> enough time to observe the peer interaction.
+
+```bash
+# Terminal 1 (bootstrap + submitter) — start this LAST:
+uv run swarmsolve peer --port 9000 --file examples/puzzles/hard_9x9.txt \
+    --submit --node-delay 0.01 --split-depth 3 --tasks 32
+
+# Terminals 2, 3, 4, 5 (joiners) — start these FIRST:
+# --idle-limit 333 keeps them alive ~10s while you copy-paste
+uv run swarmsolve peer --port 9001 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9002 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9003 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+```
+
+> **Demo order**: Open all 4 joiners first (they'll show `waiting for tasks...`
+> and `re-bootstrapping...`). Then start the submitter. Each joiner will show
+> `peers=1` at first — this is normal, they only know the bootstrap peer.
+
+**What you'll see** (~15-20s of live action):
+- **Terminal 1**: seeds 42 tasks and starts exploring
+- **Terminals 2-5**: `re-bootstrapping to find submitter...` → `claiming task` →
+  nodes explored climbing → `received SOLUTION via gossip` or `FOUND solution`
+- **SOLUTION propagates**: the first peer to find the solution gossips it to ALL
+  known peers, so everyone stops together
+
+See the **code-level docs** in [`docs/`](docs/README.md) for detailed output
+examples and the metrics table.
 
 ## 8. Team split (5 members)
 
@@ -330,7 +448,7 @@ sequenceDiagram
 ## 6. 技术栈与目录
 
 * **语言**：Python 3.11+，并发用 `asyncio`。
-* **包管理**：[`uv`](https://docs.astral.sh/uv/)。
+* **包管理**：[`uv`](https://docs.astral.sh/uv/)（推荐）或 conda + pip。
 * **命令行/展示**：`typer` + `rich`。
 * **测试**：`pytest`。
 
@@ -338,33 +456,151 @@ sequenceDiagram
 
 ## 7. 快速开始
 
-```bash
-uv sync --extra dev                                   # 安装环境
-uv run pytest -q                                      # 跑测试
-uv run swarmsolve solve examples/puzzles/hard_9x9.txt # 单机基线
-uv run swarmsolve gen --size 16 --out puzzle16.txt    # 生成 16x16 题目
-uv run swarmsolve demo --file puzzle16.txt --peers 4  # 真实本地集群 vs 基线
+### 安装
 
-# [B] 穷举搜索（统计所有解）上的可测量加速
+#### 方式 A：uv（推荐）
+
+```bash
+uv sync --extra dev
+```
+
+#### 方式 B：conda + pip
+
+```bash
+conda create -n swarmsolve python=3.12 -y
+conda activate swarmsolve
+pip install -e .
+pip install pytest pytest-asyncio
+```
+
+### 跑测试
+
+```bash
+# uv
+uv run pytest -q
+
+# conda
+pytest -q
+```
+
+> 以下命令均以 `uv run swarmsolve <cmd>` 为例。若使用 conda/pip 安装，直接使用 `swarmsolve <cmd>` 即可。
+
+### 演示命令（适合 pre 展示）
+
+所有演示命令（`demo`/`benchmark`/`fault`/`dashboard`）都会启动**真实的多个进程**，
+通过本机真实 socket 通信，因此 CPU 密集的搜索是真正并行的。
+
+| # | 命令 | 演示什么 | 核心亮点 |
+|---|------|---------|---------|
+| 1 | `solve` | 单机约束传播 + DFS 求解 | 快速验证正确性 |
+| 2 | `gen` | 生成任意尺寸的数独 | 准备演示输入 |
+| 3 | `demo` | 单机 vs P2P 集群对比 | 分布式架构可行 |
+| 4 | `benchmark` | 穷举搜索，测量真实加速 | **近线性并行加速比** |
+| 5 | `fault` | 求解中途杀掉节点，自动重分配 | **容错 + 租约机制** |
+| 6 | `dashboard` | 各节点任务计数的实时仪表盘 | 实时负载分布 |
+| 7 | `peer` | 多终端手动演示 | 交互式现场演示 |
+
+#### 1. `solve` — 单机基线
+
+```bash
+# 简单题目（约束传播直接搞定，约 0.000s）
+uv run swarmsolve solve examples/puzzles/easy_9x9.txt
+
+# 困难题目（深搜索树，约 0.3s，探索 6050+ 节点）
+uv run swarmsolve solve examples/puzzles/hard_9x9.txt
+```
+
+输出解出的棋盘及耗时统计（`time`、`nodes`、`dead_ends`）。
+
+#### 2. `gen` — 生成题目
+
+```bash
+uv run swarmsolve gen --size 16 --out examples/puzzles/puzzle16.txt
+uv run swarmsolve gen --size 25 --out examples/puzzles/puzzle25.txt   # 压力测试用
+```
+
+先生成完整解，再随机挖空，保证可解。输出到 `examples/puzzles/`，所有题目文件放在一起。
+
+#### 3. `demo` — 单机 vs P2P 集群
+
+```bash
+# 9x9 — 快速，适合快速概览
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4
+
+# 16x16 — 更大棋盘，更多任务可分配
+uv run swarmsolve demo --file examples/puzzles/puzzle16.txt --peers 4
+```
+
+展示：
+1. 单机基线耗时
+2. 各节点报告：谁找到解、探索节点数、耗时
+3. Wall-clock 对比
+
+**注意**：首解搜索并行度有限（解只位于一条深路径上），请用下面的 `benchmark` 观察真实加速。
+
+#### 4. `benchmark` — 穷举搜索，真实加速
+
+```bash
 uv run swarmsolve benchmark --file examples/puzzles/hard_9x9.txt \
     --peers 4 --node-delay 0.0012 --split-depth 4
-# [A] 容错：求解中途杀掉一个节点，其任务被自动重分配
-uv run swarmsolve fault --file examples/puzzles/hard_9x9.txt --peers 4 --kill-peer 2
-# [C] 各节点任务计数的实时仪表盘
+```
+
+展示 **4 节点约 2× 加速**（wall clock）。穷举整棵树（统计所有解），任务天然可并行。
+输出验证："correctness OK: all solutions covered exactly once"。
+
+#### 5. `fault` — 容错演示
+
+```bash
+uv run swarmsolve fault --file examples/puzzles/easy_9x9.txt --peers 4 --kill-peer 2
+```
+
+求解中途杀掉 peer #2，集群**仍能成功求解**。因为被杀节点的租约过期，其任务被其他节点
+自动回收。输出确认："swarm STILL solved the puzzle ... despite the failure"。
+
+#### 6. `dashboard` — 实时仪表盘
+
+```bash
 uv run swarmsolve dashboard --file examples/puzzles/hard_9x9.txt --peers 4 --node-delay 0.003
 ```
 
-多终端/多机手动演示：
+实时刷新的各节点 `open` / `claimed` / `dead_ends` / `done` 计数表，直观展示任务在节点间
+的流动与分配。
+
+#### 7. `peer` — 多终端手动演示
+
+**最具互动性的演示。** 打开 4-5 个终端并排显示，观察节点如何互相发现、认领任务、实时协作。
+
+> **为什么需要 `--node-delay`？** 真实数独求解太快了（约束传播在毫秒内就能解出大部分题目）。
+> `--node-delay` 给每个搜索节点加一个微小延迟，模拟 25×25 或拼图那种"昂贵搜索"——这是
+> 项目内置的演示开关，不是 hack。
+
+**推荐：9×9 困难 + 5 个节点**（约 15-20 秒演示时长）
+
 ```bash
 # 终端 1（引导节点 + 提交者）
-uv run swarmsolve peer --port 9000 --file puzzle16.txt --submit
-# 终端 2..n（加入者）
-uv run swarmsolve peer --port 9001 --file puzzle16.txt --bootstrap 127.0.0.1:9000
+uv run swarmsolve peer --port 9000 --file examples/puzzles/hard_9x9.txt \
+    --submit --node-delay 0.01 --split-depth 3 --tasks 32
+
+# 终端 2, 3, 4, 5（加入者，各自开一个终端）
+uv run swarmsolve peer --port 9001 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9002 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9003 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
 ```
 
-`demo`/`benchmark`/`fault`/`dashboard` 都会启动**真实的多个进程**，通过本机真实
-socket 通信，因此 CPU 密集的搜索是真正并行的。**注意**：首*解*搜索几乎无法并行
-（解位于一条深路径上），因此请用 `benchmark`（穷举搜索）来观察诚实的近线性加速。
+> **提示**：先开所有加入者（它们会等待提交者），最后启动提交者。每个加入者初始显示
+> `peers=1` 是正常的——它们只知道 bootstrap 节点。随着任务在网络中流动，它们会互相发现。
+
+**你将看到**（约 15-20 秒演示时长）：
+- **终端 1**：切分 42 个任务并开始探索
+- **终端 2-5**：`re-bootstrapping to find submitter...` → `claiming task` →
+  探索节点数不断增长 → `received SOLUTION via gossip` 或 `FOUND solution`
+- **SOLUTION 传播**：第一个找到解的节点通过 gossip 发给所有已知节点，所有人同时停止
+
 代码级三语详解见 [`docs/`](docs/README.md)。
 
 ## 8. 五人分工
@@ -511,7 +747,7 @@ sequenceDiagram
 ## 6. 技術棧與目錄
 
 * **語言**：Python 3.11+，並行採用 `asyncio`。
-* **套件管理**：[`uv`](https://docs.astral.sh/uv/)。
+* **套件管理**：[`uv`](https://docs.astral.sh/uv/)（推薦）或 conda + pip。
 * **命令列/展示**：`typer` + `rich`。
 * **測試**：`pytest`。
 
@@ -519,33 +755,151 @@ sequenceDiagram
 
 ## 7. 快速開始
 
-```bash
-uv sync --extra dev                                   # 安裝環境
-uv run pytest -q                                      # 跑測試
-uv run swarmsolve solve examples/puzzles/hard_9x9.txt # 單機基準
-uv run swarmsolve gen --size 16 --out puzzle16.txt    # 產生 16x16 題目
-uv run swarmsolve demo --file puzzle16.txt --peers 4  # 真實本地叢集 vs 基準
+### 安裝
 
-# [B] 窮舉搜尋（統計所有解）上的可量測加速
+#### 方式 A：uv（推薦）
+
+```bash
+uv sync --extra dev
+```
+
+#### 方式 B：conda + pip
+
+```bash
+conda create -n swarmsolve python=3.12 -y
+conda activate swarmsolve
+pip install -e .
+pip install pytest pytest-asyncio
+```
+
+### 跑測試
+
+```bash
+# uv
+uv run pytest -q
+
+# conda
+pytest -q
+```
+
+> 以下命令均以 `uv run swarmsolve <cmd>` 為例。若使用 conda/pip 安裝，直接使用 `swarmsolve <cmd>` 即可。
+
+### 演示命令（適合 pre 展示）
+
+所有演示命令（`demo`/`benchmark`/`fault`/`dashboard`）都會啟動**真實的多個行程**，
+透過本機真實 socket 通訊，因此 CPU 密集的搜尋是真正並行的。
+
+| # | 命令 | 演示什麼 | 核心亮點 |
+|---|------|---------|---------|
+| 1 | `solve` | 單機約束傳播 + DFS 求解 | 快速驗證正確性 |
+| 2 | `gen` | 生成任意尺寸的數獨 | 準備演示輸入 |
+| 3 | `demo` | 單機 vs P2P 叢集對比 | 分散式架構可行 |
+| 4 | `benchmark` | 窮舉搜尋，測量真實加速 | **近線性並行加速比** |
+| 5 | `fault` | 求解中途殺掉節點，自動重分配 | **容錯 + 租約機制** |
+| 6 | `dashboard` | 各節點任務計數的即時儀表板 | 即時負載分佈 |
+| 7 | `peer` | 多終端機手動演示 | 互動式現場演示 |
+
+#### 1. `solve` — 單機基準
+
+```bash
+# 簡單題目（約束傳播直接搞定，約 0.000s）
+uv run swarmsolve solve examples/puzzles/easy_9x9.txt
+
+# 困難題目（深搜尋樹，約 0.3s，探索 6050+ 節點）
+uv run swarmsolve solve examples/puzzles/hard_9x9.txt
+```
+
+輸出解出的棋盤及耗時統計（`time`、`nodes`、`dead_ends`）。
+
+#### 2. `gen` — 生成題目
+
+```bash
+uv run swarmsolve gen --size 16 --out examples/puzzles/puzzle16.txt
+uv run swarmsolve gen --size 25 --out examples/puzzles/puzzle25.txt   # 壓力測試用
+```
+
+先生成完整解，再隨機挖空，保證可解。輸出到 `examples/puzzles/`，所有題目檔案放在一起。
+
+#### 3. `demo` — 單機 vs P2P 叢集
+
+```bash
+# 9x9 — 快速，適合快速概覽
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4
+
+# 16x16 — 更大棋盤，更多任務可分配
+uv run swarmsolve demo --file examples/puzzles/puzzle16.txt --peers 4
+```
+
+展示：
+1. 單機基準耗時
+2. 各節點報告：誰找到解、探索節點數、耗時
+3. Wall-clock 對比
+
+**注意**：首解搜尋並行度有限（解只位於一條深路徑上），請用下面的 `benchmark` 觀察真實加速。
+
+#### 4. `benchmark` — 窮舉搜尋，真實加速
+
+```bash
 uv run swarmsolve benchmark --file examples/puzzles/hard_9x9.txt \
     --peers 4 --node-delay 0.0012 --split-depth 4
-# [A] 容錯：求解中途殺掉一個節點，其任務被自動重分配
-uv run swarmsolve fault --file examples/puzzles/hard_9x9.txt --peers 4 --kill-peer 2
-# [C] 各節點任務計數的即時儀表板
+```
+
+展示 **4 節點約 2× 加速**（wall clock）。窮舉整棵樹（統計所有解），任務天然可並行。
+輸出驗證："correctness OK: all solutions covered exactly once"。
+
+#### 5. `fault` — 容錯演示
+
+```bash
+uv run swarmsolve fault --file examples/puzzles/easy_9x9.txt --peers 4 --kill-peer 2
+```
+
+求解中途殺掉 peer #2，叢集**仍能成功求解**。因為被殺節點的租約過期，其任務被其他節點
+自動回收。輸出確認："swarm STILL solved the puzzle ... despite the failure"。
+
+#### 6. `dashboard` — 即時儀表板
+
+```bash
 uv run swarmsolve dashboard --file examples/puzzles/hard_9x9.txt --peers 4 --node-delay 0.003
 ```
 
-多終端機/多機手動演示：
+即時重新整理的各節點 `open` / `claimed` / `dead_ends` / `done` 計數表，直觀展示任務在節點間
+的流動與分配。
+
+#### 7. `peer` — 多終端機手動演示
+
+**最具互動性的演示。** 開啟 4-5 個終端機並排顯示，觀察節點如何互相發現、認領任務、即時協作。
+
+> **為什麼需要 `--node-delay`？** 真實數獨求解太快了（約束傳播在毫秒內就能解出大部分題目）。
+> `--node-delay` 給每個搜尋節點加一個微小延遲，模擬 25×25 或拼圖那種「昂貴搜尋」——這是
+> 專案內建的演示開關，不是 hack。
+
+**推薦：9×9 困難 + 5 個節點**（約 15-20 秒演示時長）
+
 ```bash
 # 終端機 1（引導節點 + 提交者）
-uv run swarmsolve peer --port 9000 --file puzzle16.txt --submit
-# 終端機 2..n（加入者）
-uv run swarmsolve peer --port 9001 --file puzzle16.txt --bootstrap 127.0.0.1:9000
+uv run swarmsolve peer --port 9000 --file examples/puzzles/hard_9x9.txt \
+    --submit --node-delay 0.01 --split-depth 3 --tasks 32
+
+# 終端機 2, 3, 4, 5（加入者，各自開一個終端機）
+uv run swarmsolve peer --port 9001 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9002 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9003 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
+uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
+    --bootstrap 127.0.0.1:9000 --node-delay 0.01 --split-depth 3 --idle-limit 333
 ```
 
-`demo`/`benchmark`/`fault`/`dashboard` 都會啟動**真實的多個行程**，透過本機真實
-socket 通訊，因此 CPU 密集的搜尋是真正並行的。**注意**：首*解*搜尋幾乎無法並行
-（解位於一條深路徑上），因此請用 `benchmark`（窮舉搜尋）來觀察誠實的近線性加速。
+> **提示**：先開所有加入者（它們會等待提交者），最後啟動提交者。每個加入者初始顯示
+> `peers=1` 是正常的——它們只知道 bootstrap 節點。隨著任務在網路中流動，它們會互相發現。
+
+**你將看到**（約 15-20 秒演示時長）：
+- **終端機 1**：切分 42 個任務並開始探索
+- **終端機 2-5**：`re-bootstrapping to find submitter...` → `claiming task` →
+  探索節點數不斷增長 → `received SOLUTION via gossip` 或 `FOUND solution`
+- **SOLUTION 傳播**：第一個找到解的節點通過 gossip 發給所有已知節點，所有人同時停止
+
 程式碼層級三語詳解見 [`docs/`](docs/README.md)。
 
 ## 8. 五人分工
