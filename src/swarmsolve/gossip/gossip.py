@@ -50,13 +50,18 @@ class Gossip:
         return True
 
     async def handle(self, msg: Message) -> None:
-        """Process an inbound gossip message (de-dup -> deliver -> forward)."""
+        """Process an inbound gossip message: de-dup -> deliver -> forward.
+
+        This three-step pipeline makes epidemic spread both complete (reaches the
+        whole overlay with high probability) and bounded (no message is delivered
+        or relayed twice).
+        """
         if not self._mark_seen(msg.msg_id):
-            return
+            return  # 1. de-dup: already seen this msg_id -> stop (caps traffic)
         if self.deliver:
-            await self.deliver(msg)
+            await self.deliver(msg)       # 2. deliver: hand to the local app (_on_gossip)
         if msg.ttl > 0:
-            await self._forward(msg)
+            await self._forward(msg)      # 3. forward: relay onward while ttl remains
 
     async def broadcast(self, msg: Message) -> None:
         """Originate a new gossip message from this peer."""
@@ -64,6 +69,8 @@ class Gossip:
         await self._forward(msg)
 
     async def _forward(self, msg: Message) -> None:
+        """Relay to ``fanout`` random neighbours with ttl decremented (flood
+        control): larger fan-out = faster/wider coverage but more traffic."""
         targets = self._pick_targets(exclude=msg.sender)
         relay = Message(
             type=msg.type,

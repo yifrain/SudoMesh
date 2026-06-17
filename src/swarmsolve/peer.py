@@ -146,6 +146,12 @@ class Peer:
     # ---- message dispatch ---------------------------------------------
 
     async def _dispatch(self, msg: Message, addr, kind: str) -> None:
+        """Single inbound entry point for EVERY message this peer receives.
+
+        Routes by category: Kademlia RPCs go straight to the DHT; all
+        application + coordination traffic goes through gossip, which de-dups,
+        delivers locally (``_on_gossip``) and re-forwards to neighbours.
+        """
         if msg.type in (
             MessageType.PING,
             MessageType.PONG,
@@ -154,20 +160,25 @@ class Peer:
         ):
             await self.dht.handle(msg, addr)
         else:
-            # All application/coordination traffic flows through gossip
-            # (which de-dups, delivers locally, and re-forwards).
             await self.gossip.handle(msg)
 
     async def _on_gossip(self, msg: Message) -> None:
+        """Receiving end of every application link: apply one delivered message
+        to local state. Each branch is one of the protocol's data-flow links."""
         if msg.type == MessageType.OPEN_TASK:
+            # producer link: a new unexplored subtree we may pick up
             self.scheduler.add_open(Task.from_dict(msg.payload["task"]))
         elif msg.type == MessageType.DEAD_END:
+            # pruning link: this subtree is invalid -> never explore it again
             self.scheduler.mark_dead([tuple(p) for p in msg.payload["path"]])
         elif msg.type == MessageType.TASK_DONE:
+            # progress link: subtree already fully explored elsewhere
             self.scheduler.mark_done([tuple(p) for p in msg.payload["path"]])
         elif msg.type == MessageType.TASK_CLAIM:
+            # dedup link: someone leased this task -> drop it from our open pool
             self.scheduler.note_claim(Task.from_dict(msg.payload["task"]))
         elif msg.type == MessageType.SOLUTION:
+            # termination link: the first solution stops the whole swarm
             if self.solution is None:
                 flat = msg.payload["board"]
                 self.solution = Board.from_flat(self.board.n, flat)
@@ -258,21 +269,35 @@ class Peer:
     # ---- the work loop ------------------------------------------------
 
     async def run(self) -> Board | None:
+        """Consumer loop: pick a task -> work on it -> repeat.
+
+        Exits when a solution is found/received (``_stop`` set) or no work is
+        available for ``idle_limit`` consecutive polls — the idle window also
+        gives a crashed peer's lease time to expire so its task is reclaimed.
+        """
         idle_rounds = 0
         while not self._stop.is_set():
-            self._maybe_tick()
-            task = self._pick_task()
+            self._maybe_tick()                      # refresh the live dashboard
+            task = self._pick_task()                # closest-to-me, owner-filtered
             if task is None:
                 idle_rounds += 1
-                if idle_rounds > self.idle_limit:  # nothing left to do
+                if idle_rounds > self.idle_limit:   # quiescent -> we're done
                     break
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.03)           # wait for tasks to arrive
                 continue
             idle_rounds = 0
-            await self._work_on(task)
+            await self._work_on(task)               # claim -> split/solve -> gossip
         return self.solution
 
     async def _work_on(self, task: Task) -> None:
+        """Process one task end to end: claim -> split-or-solve -> publish.
+
+        The heart of the consumer side, in order:
+          1. last-moment dedup (skip if already done/dead/owned by a live peer);
+          2. claim a lease and announce TASK_CLAIM;
+          3. work-stealing: re-split a shallow task into finer OPEN_TASKs; else
+          4. DFS the subtree, emitting DEAD_END (pruning) + SOLUTION / TASK_DONE.
+        """
         # Last-moment dedup: a CLAIM/DONE for this task may have arrived after
         # we picked it. Skipping here avoids most duplicate exploration.
         tid = task.id

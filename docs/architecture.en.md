@@ -455,6 +455,22 @@ Exhaustive count-all-solutions on a wide 9×9 (97,605 nodes, 45,475 solutions),
 | 2 | 20.3 s | 1.50× | 1.71× | balanced |
 | 4 | 11.6 s | 2.55× | 3.0× | 24k / 24k / 25k / 23k |
 
+```mermaid
+xychart-beta
+    title "Exact-mode speedup vs peers (wide 9x9, exhaustive)"
+    x-axis "peers" [1, 2, 4]
+    y-axis "speedup (x)" 0 --> 4
+    line [1, 2, 4]
+    line [1.0, 1.71, 3.0]
+    line [0.8, 1.5, 2.55]
+```
+
+_Series, in declared order: **ideal linear** (1/2/4×) · **measured vs 1-peer**
+(1.0/1.71/3.0×) · **measured vs single-machine baseline** (0.8/1.5/2.55×). The
+vs-1-peer curve tracks the ideal closely (75 % efficiency at 4 peers); the
+vs-baseline curve sits lower only because of the fixed per-process framework
+overhead._
+
 Every run reported **correctness OK: all 45,475 solutions covered exactly once**
 (node totals 97,260–97,512 ≈ baseline 97,605 → ~0 % duplication). The gap from the
 ideal 4× is the fixed framework overhead (process spawn + settle + idle tail),

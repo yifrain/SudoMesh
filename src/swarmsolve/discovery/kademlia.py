@@ -86,10 +86,11 @@ class KademliaNode:
         """
         queried: set[NodeID] = set()
         shortlist = self.table.closest(target)
-        for _ in range(6):  # bounded rounds; converges in O(log n)
+        for _ in range(6):  # bounded rounds; each round roughly halves the distance -> O(log n)
+            # query the alpha closest not-yet-queried peers in parallel (low latency)
             batch = [c for c in shortlist if c.node_id not in queried][:alpha]
             if not batch:
-                break
+                break  # converged: no closer un-queried peer remains
             futures = []
             for c in batch:
                 queried.add(c.node_id)
@@ -103,7 +104,7 @@ class KademliaNode:
                 await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
-            shortlist = self.table.closest(target)
+            shortlist = self.table.closest(target)  # replies populated buckets with closer peers
         return shortlist
 
     def closest_to_key(self, key: NodeID, count: int) -> list[Contact]:
