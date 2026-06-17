@@ -409,4 +409,65 @@ correctness OK: all 1 solution(s) covered exactly once
 speedup  : ~1.67x (wall clock)
 ```
 Why not the ideal 4×: duplicate exploration (async gossip) + load imbalance — the
-trade-off discussed in §8.
+trade-off discussed in §8. **Exact mode (§14) removes both.**
+
+---
+
+## 14. Exact mode: single-owner execution + virtual nodes (M5)
+
+First-solution search barely parallelizes; the real win is in **exhaustive**
+search (count all / prove uniqueness). Naive work-stealing duplicates work under
+async gossip. *Exact mode* makes the swarm **deterministic, duplicate-free and
+exactly counting** — selected with `--exclusive` (default for `benchmark`).
+
+### How it works
+* **Single owner per task.** A task key maps by XOR distance to exactly one owner;
+  a peer runs a task only if it is the owner ([`_owns`/`_owner_of`](../src/swarmsolve/peer.py)).
+* **Reliable routing (DHT `put`).** An OPEN_TASK is delivered **directly to its
+  owner over TCP** (ttl=0, no re-forward) instead of gossiped, so nothing is lost
+  — [`_route_open_task`](../src/swarmsolve/peer.py).
+* **Static distribution.** All tasks are seeded up front (finer frontier) and
+  runtime work-stealing is disabled — this removes the late-arrival / termination
+  problem that otherwise made a peer idle out before its tasks arrived (we saw
+  exactly that: peers=2 dropped to 29,982/45,475 solutions before the fix).
+* **Virtual nodes (consistent hashing).** With only a few peers, a handful of IDs
+  split the 160-bit space very unevenly (one peer got ~47% of the work). Each peer
+  registers `--vnodes` virtual IDs; tasks map to the nearest vnode → even load.
+  This is the classic Ch.5 load-balancing technique.
+
+### Exact vs work-stealing
+
+| Mode | Duplicate work | Solution count | Best on | Robustness |
+|------|----------------|----------------|---------|-----------|
+| Work-stealing (`--no-exclusive`) | yes (node-level) | exact (dedup) | unbalanced trees | tolerant of loss/churn |
+| Exclusive (`--exclusive`, default) | none | exact | balanced trees | needs reliable delivery |
+
+This is a clean **consistency-vs-availability** talking point: exclusive favours
+exactness/no-duplication; work-stealing favours availability/throughput.
+
+### Measured results (for the report)
+Exhaustive count-all-solutions on a wide 9×9 (97,605 nodes, 45,475 solutions),
+`--node-delay 0.0002`, exclusive + 16 vnodes, single machine baseline ≈ 28–30 s:
+
+| peers | wall time | vs baseline | vs 1-peer | per-peer node spread |
+|-------|-----------|-------------|-----------|----------------------|
+| 1 | 34.8 s | 0.80× | 1.0× | — |
+| 2 | 20.3 s | 1.50× | 1.71× | balanced |
+| 4 | 11.6 s | 2.55× | 3.0× | 24k / 24k / 25k / 23k |
+
+Every run reported **correctness OK: all 45,475 solutions covered exactly once**
+(node totals 97,260–97,512 ≈ baseline 97,605 → ~0 % duplication). The gap from the
+ideal 4× is the fixed framework overhead (process spawn + settle + idle tail),
+visible as 0.80× at 1 peer; *relative to 1 peer* the swarm scales ~3.0× on 4 (75 %
+efficiency). Reproduce with:
+```bash
+uv run swarmsolve gen --size 9 --clue-ratio 0.28 --seed 7 --out wide.txt
+for p in 1 2 4; do uv run swarmsolve benchmark --file wide.txt --peers $p --node-delay 0.0002; done
+```
+
+### 25×25
+The solver is size-generic (N = k²). `swarmsolve gen --size 25` builds a valid
+25×25 instantly; high-clue instances solve immediately via propagation
+(`solve` → 1 node, 0.00 s). Full first-solution search of sparsely-clued 25×25 is
+NP-hard (the tree explodes), so we quantify the parallel speedup on the controlled
+*exhaustive* benchmark above rather than on a single 25×25 first-solution run.

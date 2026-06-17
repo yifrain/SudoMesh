@@ -203,8 +203,10 @@ signatures (see the docstrings in each module).
   work-stealing, first-solution stop + exhaustive `benchmark` with real speedup.
 * **M4 — Fault tolerance** *(done)*: `swarmsolve fault` kills a peer mid-solve;
   lease expiry reassigns its task; the swarm still finishes.
-* **M5 — Scale & polish** *(dashboard done)*: live `rich` dashboard implemented;
-  remaining: 25×25 tuning + metrics tables for the report/oral exam.
+* **M5 — Scale & polish** *(done)*: live dashboard; **deterministic exact mode**
+  (single-owner + virtual nodes) → exact solution counts, **~2.55× on 4 peers,
+  ~0 % duplicate work**; 25×25 generation + propagation solving. Metrics table &
+  details in [`docs/`](docs/README.md) §14.
 * **M6 (stretch)** — jigsaw extension reusing the same framework.
 
 ## 10. Design decisions & trade-offs
@@ -387,8 +389,9 @@ socket 通信，因此 CPU 密集的搜索是真正并行的。**注意**：首*
   以及 `benchmark` 穷举搜索的真实加速。
 * **M4 — 容错**（已完成）：`swarmsolve fault` 求解中途杀掉一个节点；租约过期重分配
   其任务；集群仍能完成。
-* **M5 — 规模与打磨**（仪表盘已完成）：实时 `rich` dashboard 已实现；待办：25×25
-  调优 + 为报告/口试准备度量表。
+* **M5 — 规模与打磨**（已完成）：实时 dashboard；**确定性精确模式**（单一负责人 +
+  虚拟节点）→ 解计数精确、**4 节点 ~2.55×、约 0% 重复工作**；25×25 生成 + 约束传播求解。
+  度量表与细节见 [`docs/`](docs/README.md) 第 14 节。
 * **M6（挑战）** — 复用同一框架实现拼图扩展。
 
 ## 10. 设计取舍
@@ -567,8 +570,9 @@ socket 通訊，因此 CPU 密集的搜尋是真正並行的。**注意**：首*
   以及 `benchmark` 窮舉搜尋的真實加速。
 * **M4 — 容錯**（已完成）：`swarmsolve fault` 求解中途殺掉一個節點；租約過期重分配
   其任務；叢集仍能完成。
-* **M5 — 規模與打磨**（儀表板已完成）：即時 `rich` dashboard 已實作；待辦：25×25
-  調校 + 為報告/口試準備量測表。
+* **M5 — 規模與打磨**（已完成）：即時 dashboard；**確定性精確模式**（單一負責人 +
+  虛擬節點）→ 解計數精確、**4 節點 ~2.55×、約 0% 重複工作**；25×25 生成 + 約束傳播求解。
+  量測表與細節見 [`docs/`](docs/README.md) 第 14 節。
 * **M6（挑戰）** — 重用同一框架實作拼圖擴充。
 
 ## 10. 設計取捨

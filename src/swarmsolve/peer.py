@@ -21,7 +21,7 @@ import asyncio
 import time
 
 from swarmsolve.discovery.kademlia import KademliaNode
-from swarmsolve.discovery.node_id import NodeID
+from swarmsolve.discovery.node_id import NodeID, xor_distance
 from swarmsolve.discovery.routing import Contact
 from swarmsolve.gossip.gossip import Gossip
 from swarmsolve.solver.board import Board
@@ -51,6 +51,8 @@ class Peer:
         split_depth: int = 0,
         enumerate_mode: bool = False,
         idle_limit: int = 30,
+        exclusive: bool = False,
+        owner_roster: list[tuple[NodeID, Contact]] | None = None,
         on_tick=None,
         tick_interval: float = 0.15,
     ) -> None:
@@ -81,6 +83,13 @@ class Peer:
         # How many idle polls before giving up. Larger values give a crashed
         # peer's lease time to expire so its task can be reclaimed (fault demo).
         self.idle_limit = idle_limit
+        # Deterministic single-owner execution. In exclusive mode a task is run
+        # ONLY by the peer whose ID is XOR-closest to the task key, eliminating
+        # duplicate exploration -> exact solution counts + near-linear speedup.
+        # ``owner_roster`` (all peer NodeIDs) gives a consistent ownership view;
+        # if None we fall back to the Kademlia routing table (decentralized).
+        self.exclusive = exclusive
+        self.owner_roster = owner_roster
 
         # Observability hook (used by the live dashboard).
         self.on_tick = on_tick
@@ -189,10 +198,62 @@ class Peer:
         tasks = self.seed_frontier(target_tasks)
         self.log(f"[{self.id.short()}] seeding {len(tasks)} open tasks")
         for t in tasks:
-            self.scheduler.add_open(t)
+            await self._route_open_task(t)
+
+    # ---- task selection ----------------------------------------------
+
+    def _owner_of(self, task: Task) -> Contact | None:
+        """The single owner Contact for a task (exclusive mode), or None.
+
+        ``owner_roster`` is a list of (virtual-node-id, owner-contact) pairs.
+        Virtual nodes (consistent-hashing style) smooth the load imbalance that
+        arises when only a few physical peers split the 160-bit XOR keyspace.
+        """
+        if not self.owner_roster:
+            return None
+        _, contact = min(self.owner_roster, key=lambda pair: xor_distance(pair[0], task.key))
+        return contact
+
+    def _owns(self, task: Task) -> bool:
+        """Exclusive mode: am I the single owner (XOR-closest peer) of this task?"""
+        owner = self._owner_of(task)
+        if owner is not None:
+            return owner.node_id == self.id
+        return self.dht.is_responsible_for(task.key, replicas=1)
+
+    async def _route_open_task(self, task: Task) -> None:
+        """Publish an OPEN_TASK.
+
+        Exclusive mode: deliver it **reliably (TCP), straight to its single
+        owner** (routed by XOR key), so nothing is lost or duplicated — the DHT
+        used as a put(task -> owner). ttl=0 means the owner won't re-forward it.
+        Otherwise: best-effort gossip (work-stealing tolerates loss/overlap).
+        """
+        payload = {"task": task.to_dict()}
+        if self.exclusive and self.owner_roster:
+            owner = self._owner_of(task)
+            if owner.node_id == self.id:
+                self.scheduler.add_open(task)
+            else:
+                await self.transport.send_tcp(
+                    owner.host, owner.port,
+                    Message(MessageType.OPEN_TASK, self.id.hex(), payload, ttl=0),
+                )
+        else:
+            self.scheduler.add_open(task)
             await self.gossip.broadcast(
-                Message(MessageType.OPEN_TASK, self.id.hex(), {"task": t.to_dict()})
+                Message(MessageType.OPEN_TASK, self.id.hex(), payload)
             )
+
+    def _pick_task(self) -> Task | None:
+        """Pick the best open task: closest-to-my-ID, optionally owner-filtered."""
+        self.scheduler.reclaim_expired()
+        pool = list(self.scheduler.open.values())
+        if self.exclusive:
+            pool = [t for t in pool if self._owns(t)]
+        if not pool:
+            return None
+        return min(pool, key=lambda t: xor_distance(self.id, t.key))
 
     # ---- the work loop ------------------------------------------------
 
@@ -200,7 +261,7 @@ class Peer:
         idle_rounds = 0
         while not self._stop.is_set():
             self._maybe_tick()
-            task = self.scheduler.next_task()
+            task = self._pick_task()
             if task is None:
                 idle_rounds += 1
                 if idle_rounds > self.idle_limit:  # nothing left to do
@@ -226,17 +287,14 @@ class Peer:
             Message(MessageType.TASK_CLAIM, self.id.hex(), {"task": task.to_dict()})
         )
 
-        # Work-stealing: re-split shallow tasks so the grain matches the swarm.
-        if self.split_depth and task.depth < self.split_depth:
+        # Work-stealing (non-exclusive only): re-split shallow tasks so the grain
+        # matches the swarm. Exclusive mode distributes statically at submit time
+        # instead, which avoids the termination / late-arrival problem.
+        if self.split_depth and task.depth < self.split_depth and not self.exclusive:
             children = expand_subtasks(self.board, task.path)
             if len(children) > 1:
                 for child_path in children:
-                    child = Task(path=child_path)
-                    self.scheduler.add_open(child)
-                    await self.gossip.broadcast(
-                        Message(MessageType.OPEN_TASK, self.id.hex(),
-                                {"task": child.to_dict()})
-                    )
+                    await self._route_open_task(Task(path=child_path))
                 # The subtree is now covered by its children -> retire this node.
                 self.scheduler.mark_done(task.path)
                 await self.gossip.broadcast(

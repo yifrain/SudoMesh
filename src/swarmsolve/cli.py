@@ -66,6 +66,15 @@ def _peer_worker(
             split_depth=cfg["split_depth"],
             enumerate_mode=cfg.get("enumerate", False),
             idle_limit=cfg.get("idle_limit", 30),
+            exclusive=cfg.get("exclusive", False),
+            owner_roster=(
+                [(NodeID.from_string(f"127.0.0.1:{BASE_PORT + r}#vn{v}"),
+                  Contact(NodeID.from_string(f"127.0.0.1:{BASE_PORT + r}"),
+                          "127.0.0.1", BASE_PORT + r))
+                 for r in range(cfg["peers"])
+                 for v in range(cfg.get("vnodes", 16))]
+                if cfg.get("exclusive") else None
+            ),
         )
         if cfg.get("report"):
             peer.on_tick = lambda snap, r=rank: q.put(("stat", r, snap))
@@ -93,6 +102,7 @@ def _peer_worker(
 
 
 def _spawn(peers: int, n: int, flat: list[int], target: int, cfg: dict):
+    cfg = {**cfg, "peers": peers}  # workers need the roster size for ownership
     ctx = mp.get_context("spawn")
     q: mp.Queue = ctx.Queue()
     procs = [
@@ -258,6 +268,10 @@ def benchmark(
     ),
     split_depth: int = typer.Option(2, help="Work-stealing depth"),
     lease: float = typer.Option(8.0, help="Task lease seconds"),
+    exclusive: bool = typer.Option(
+        True, help="Deterministic single-owner execution (no duplicate work)"
+    ),
+    vnodes: int = typer.Option(16, help="Virtual nodes per peer (load smoothing)"),
     seed: int = typer.Option(0, help="RNG seed for generation"),
 ) -> None:
     """Exhaustively explore the whole tree (count all solutions / prove uniqueness).
@@ -266,10 +280,13 @@ def benchmark(
     workload is embarrassingly parallel, so the swarm shows near-linear speedup.
     """
     board = _load_or_generate(file, size, seed)
-    target = peers * 2
+    # Exclusive distributes statically at submit time → seed a finer frontier for
+    # balance; work-stealing refines at runtime from a coarse seed.
+    target = peers * 64 if exclusive else peers * 2
     n = board.n
+    mode = "exclusive (single-owner)" if exclusive else "work-stealing (may duplicate)"
     console.print(f"[bold]Exhaustive benchmark: {n}x{n}, peers={peers}, "
-                  f"node_delay={node_delay}s[/]")
+                  f"node_delay={node_delay}s, mode={mode}[/]")
 
     console.print("\n[bold]1) Single-machine baseline (full tree)[/]")
     t0 = time.perf_counter()
@@ -280,7 +297,8 @@ def benchmark(
 
     console.print("\n[bold]2) P2P swarm (full tree)[/]")
     cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
-           "settle": 0.6, "report": False, "enumerate": True}
+           "settle": 0.5, "report": False, "enumerate": True, "vnodes": vnodes,
+           "exclusive": exclusive, "idle_limit": 30 if exclusive else 60}
     procs, q = _spawn(peers, n, board.to_flat(), target, cfg)
     swarm_t0 = time.perf_counter()
     results = _collect(procs, q)
