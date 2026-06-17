@@ -256,3 +256,120 @@ uv run swarmsolve benchmark --file examples/puzzles/hard_9x9.txt \
 | 結構化放置 / 負載平衡（第5章） | `task_key` + `scheduler.next_task` |
 | 機率覆蓋（第7章 BubbleStorm） | gossip 扇出 + seen 集合 |
 | 容錯 / 抖動 | 租約 + `reclaim_expired` + `is_responsible_for` |
+
+---
+
+## 11. 課程知識點詳解
+
+每個課程章節在程式碼中的體現。
+
+* **第1章 — P2P 基礎。** SwarmSolve 是*純* P2P 系統：每個節點既是用戶端又是伺服器，
+  **沒有中央索引**（不同於 Napster），節點自組織，系統**自擴展**（節點越多搜尋吞吐越高）
+  且**具韌性**（容忍崩潰）。見 [`peer.py`](../src/swarmsolve/peer.py)。
+* **第2章 — 非結構化覆蓋網與 gossip。** Gnutella 以 TTL 氾濫查詢。我們保留其優點
+  （gossip + TTL），並用 **seen 集合**去重修正冗餘。三類應用訊息都搭載於此 gossip 之上。
+  見 [`gossip/gossip.py`](../src/swarmsolve/gossip/gossip.py)。
+* **第3章 — 隨機圖模型。** Kademlia 建構的覆蓋網是低直徑圖（O(log n) 跳）；每個節點保存
+  O(k·log n) 狀態——這是度與直徑的經典取捨（小世界 / 無尺度）。
+* **第4章 — DHT（CAN / Chord）。** 結構化覆蓋網以定向 O(log n) 路由與 put/get 鍵介面
+  取代氾濫。我們採用此*結構化*哲學，並選 Kademlia（第6章）作為具體 DHT。
+* **第5章 — 負載平衡（Distance-Halving 思想）。** 目標是均勻分攤負載。我們把任務路徑
+  均勻雜湊進 XOR 鍵空間，*免費*得到均勻的任務分佈；離 key 最近的節點擁有該任務。見
+  [`task_key`](../src/swarmsolve/discovery/node_id.py) + [`Scheduler.next_task`](../src/swarmsolve/tasks/scheduler.py)。
+* **第6章 — Kademlia（我們的探索層）。** XOR 距離、偏好長壽節點的 k桶（抗日蝕）、基於
+  UDP 的迭代 FIND_NODE——既是探索也是任務放置的骨幹。見 [`discovery/`](../src/swarmsolve/discovery)。
+* **第7章 — BubbleStorm（機率覆蓋）。** 隨機副本使查詢以高機率遇到資料。我們的 gossip
+  扇出 + TTL 實現同樣思想：訊息以高機率覆蓋整個網路，同時流量受控。
+
+---
+
+## 12. 訊息鏈路詳解（資料流走讀）
+
+每一步都標註了執行的函式，便於端到端追蹤鏈路。
+
+### 12.1 節點加入（bootstrap）
+```
+Peer.start(boot)
+  → KademliaNode.bootstrap([boot])      # discovery/kademlia.py
+      → PING boot（UDP）
+      → lookup(self)：多輪 FIND_NODE      # 迭代，O(log n)
+      → RoutingTable.add(contacts)       # k桶逐漸填滿
+```
+結果：加入者認識足夠多的鄰居以進行 gossip。
+
+### 12.2 OPEN_TASK（生產 → 消費）
+```
+Peer.submit(target)                       # 僅提交者
+  → seed_frontier()：expand_subtasks(root)
+  → gossip.broadcast(OPEN_TASK)           # 去重(seen) → 轉發給 fanout，ttl--
+遠端 Peer._on_gossip(OPEN_TASK)
+  → Scheduler.add_open(task)              # 對 done/dead/claimed 去重
+Peer.run() → Scheduler.next_task()        # 選離我最近(XOR)的任務
+```
+
+### 12.3 TASK_CLAIM（分散式租約）
+```
+Peer._work_on(task)
+  → Scheduler.claim_local(task)           # lease_expires = now + lease
+  → gossip.broadcast(TASK_CLAIM)
+遠端 Peer._on_gossip(TASK_CLAIM)
+  → Scheduler.note_claim(task)            # 從 open 移除 → 去重
+```
+
+### 12.4 DEAD_END（共享剪枝）
+```
+solve_subtree(record_dead_end=_publish_dead_end)
+  → 在淺層(≤ dead_end_share_depth)發生矛盾
+  → _publish_dead_end：mark_dead(path) + gossip.broadcast(DEAD_END)
+遠端 Peer._on_gossip(DEAD_END) → Scheduler.mark_dead(path)
+之後 DFS → _is_dead_end(path)==True → 跳過該子樹
+```
+
+### 12.5 SOLUTION（全域停止）
+```
+solve_subtree → 完整棋盤
+  → self.solution = board；gossip.broadcast(SOLUTION)；_stop.set()
+遠端 Peer._on_gossip(SOLUTION) → 重建棋盤；_stop.set()
+  → 每個執行中的 DFS 內 should_stop() 觸發
+```
+
+### 12.6 故障復原（租約回收）
+```
+節點 C 持有任務 T（在每個節點上狀態為 CLAIMED）時崩潰
+  → C 的 lease_expires 過期
+  → 任一 Peer.run() → next_task() → reclaim_expired()：T → OPEN
+  → 某個存活者認領並重做 T                 # idle_limit 讓節點存活夠久
+```
+
+---
+
+## 13. 演示流程與預期輸出
+
+### A）`swarmsolve fault` — 容錯
+1. 以**窮舉**模式啟動 N 個行程，並設較大 `idle_limit`。
+2. 在 `--kill-after` 後，父行程 `terminate()` 掉 `--kill-peer` 指定的節點。
+3. 該節點租約過期；存活者接管其任務；所有任務完成。
+
+預期（4 節點，殺 #2）：
+```
+>>> killed peer #2 (PID …)
+Result
+   killed peer #2 returned a result: no (as expected)
+   surviving peers that finished: [0, 1, 3]
+   swarm STILL solved the puzzle in ~13s despite the failure
+```
+
+### C）`swarmsolve dashboard` — 即時視覺化
+`rich.Live` 表格透過 `on_tick` 掛勾更新各節點計數（鄰居 / open / claimed / dead /
+done / nodes / found），隨後印出最終的每節點報告與解出的棋盤。
+
+### B）`swarmsolve benchmark` — 誠實加速
+窮舉搜尋（統計所有解 / 驗證唯一性）天然可平行。預期（難 9×9，4 節點，
+`--node-delay 0.0012 --split-depth 4`）：
+```
+baseline : ~14.5s, 9309 nodes, 1 solutions
+swarm    : ~8.7s wall, ~13k nodes across 4 peers
+correctness OK: all 1 solution(s) covered exactly once
+speedup  : ~1.67x (wall clock)
+```
+為何達不到理想的 4×：重複探索（非同步 gossip）+ 負載不均——即第 8 節討論的取捨。

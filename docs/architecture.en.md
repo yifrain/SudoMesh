@@ -283,3 +283,130 @@ Only the `solver/` package changes; transport/discovery/gossip/tasks are reused.
 | Structured placement / load balancing (Ch.5) | `task_key` + `scheduler.next_task` |
 | Probabilistic coverage (Ch.7 BubbleStorm) | gossip fan-out + seen-set |
 | Fault tolerance / churn | leases + `reclaim_expired` + `is_responsible_for` |
+
+---
+
+## 11. Course concepts in depth
+
+How each course chapter shows up in the code.
+
+* **Ch.1 — P2P fundamentals.** SwarmSolve is a *pure* P2P system: every peer is
+  both client and server, there is **no central index** (unlike Napster), peers
+  self-organize, and the system is **self-scaling** (more peers → more search
+  throughput) and **resilient** (survives crashes). See [`peer.py`](../src/swarmsolve/peer.py).
+* **Ch.2 — Unstructured overlays & gossip.** Gnutella flooded queries with a TTL.
+  We keep the good part (gossip + TTL) and fix the redundancy with a **seen-set**
+  for de-duplication. The three application messages ride on this gossip. See
+  [`gossip/gossip.py`](../src/swarmsolve/gossip/gossip.py).
+* **Ch.3 — Random-graph models.** The overlay Kademlia builds is a low-diameter
+  graph (O(log n) hops); each node keeps O(k·log n) state — the classic
+  degree-vs-diameter trade-off (small-world / scale-free).
+* **Ch.4 — DHTs (CAN / Chord).** Structured overlays replace flooding with
+  directed O(log n) routing and a put/get key interface. We adopt this
+  *structured* philosophy and pick Kademlia (Ch.6) as the concrete DHT.
+* **Ch.5 — Load balancing (Distance-Halving spirit).** Spreading load evenly is
+  the goal. We get even task spread *for free* by hashing task paths uniformly
+  into the XOR keyspace; the closest peer owns each task. See
+  [`task_key`](../src/swarmsolve/discovery/node_id.py) + [`Scheduler.next_task`](../src/swarmsolve/tasks/scheduler.py).
+* **Ch.6 — Kademlia (our discovery layer).** XOR distance, k-buckets that prefer
+  long-lived peers (eclipse resistance), iterative FIND_NODE over UDP — the
+  backbone of both discovery and task placement. See [`discovery/`](../src/swarmsolve/discovery).
+* **Ch.7 — BubbleStorm (probabilistic coverage).** Random replication makes a
+  query meet the data with high probability. Our gossip fan-out + TTL realizes
+  the same idea: a message reaches the whole overlay w.h.p. while traffic stays
+  bounded.
+
+---
+
+## 12. Message lifecycles (data-flow walkthroughs)
+
+Each step names the function that runs, so you can trace the link end to end.
+
+### 12.1 Peer join (bootstrap)
+```
+Peer.start(boot)
+  → KademliaNode.bootstrap([boot])      # discovery/kademlia.py
+      → PING boot (UDP)
+      → lookup(self): FIND_NODE rounds   # iterative, O(log n)
+      → RoutingTable.add(contacts)       # k-buckets fill up
+```
+Result: the joiner knows enough neighbours to gossip.
+
+### 12.2 OPEN_TASK (produce → consume)
+```
+Peer.submit(target)                       # submitter only
+  → seed_frontier(): expand_subtasks(root)
+  → gossip.broadcast(OPEN_TASK)           # de-dup(seen) → forward to fanout, ttl--
+remote Peer._on_gossip(OPEN_TASK)
+  → Scheduler.add_open(task)              # dedup vs done/dead/claimed
+Peer.run() → Scheduler.next_task()        # pick closest-to-my-ID (XOR)
+```
+
+### 12.3 TASK_CLAIM (distributed lease)
+```
+Peer._work_on(task)
+  → Scheduler.claim_local(task)           # lease_expires = now + lease
+  → gossip.broadcast(TASK_CLAIM)
+remote Peer._on_gossip(TASK_CLAIM)
+  → Scheduler.note_claim(task)            # remove from open → dedup
+```
+
+### 12.4 DEAD_END (shared pruning)
+```
+solve_subtree(record_dead_end=_publish_dead_end)
+  → contradiction at shallow depth (≤ dead_end_share_depth)
+  → _publish_dead_end: mark_dead(path) + gossip.broadcast(DEAD_END)
+remote Peer._on_gossip(DEAD_END) → Scheduler.mark_dead(path)
+later DFS → _is_dead_end(path)==True → subtree skipped
+```
+
+### 12.5 SOLUTION (global stop)
+```
+solve_subtree → complete grid
+  → self.solution = board; gossip.broadcast(SOLUTION); _stop.set()
+remote Peer._on_gossip(SOLUTION) → rebuild board; _stop.set()
+  → should_stop() fires inside every running DFS
+```
+
+### 12.6 Fault recovery (lease reclaim)
+```
+peer C crashes holding task T (CLAIMED on every peer)
+  → C's lease_expires passes
+  → any Peer.run() → next_task() → reclaim_expired(): T → OPEN
+  → a survivor claims & redoes T           # idle_limit keeps peers alive
+```
+
+---
+
+## 13. Demo walkthroughs & expected output
+
+### A) `swarmsolve fault` — fault tolerance
+1. Spawns N processes in **exhaustive** mode with a generous `idle_limit`.
+2. After `--kill-after`, the parent `terminate()`s peer `--kill-peer`.
+3. That peer's lease lapses; a survivor reclaims its task; all tasks finish.
+
+Expected (4 peers, kill #2):
+```
+>>> killed peer #2 (PID …)
+Result
+   killed peer #2 returned a result: no (as expected)
+   surviving peers that finished: [0, 1, 3]
+   swarm STILL solved the puzzle in ~13s despite the failure
+```
+
+### C) `swarmsolve dashboard` — live visualization
+A `rich.Live` table refreshes per-peer counters (neighbors / open / claimed /
+dead / done / nodes / found) via the `on_tick` hook, then prints the final
+per-peer report and the solved grid.
+
+### B) `swarmsolve benchmark` — honest speedup
+Exhaustive search (count all solutions / prove uniqueness) is embarrassingly
+parallel. Expected (hard 9×9, 4 peers, `--node-delay 0.0012 --split-depth 4`):
+```
+baseline : ~14.5s, 9309 nodes, 1 solutions
+swarm    : ~8.7s wall, ~13k nodes across 4 peers
+correctness OK: all 1 solution(s) covered exactly once
+speedup  : ~1.67x (wall clock)
+```
+Why not the ideal 4×: duplicate exploration (async gossip) + load imbalance — the
+trade-off discussed in §8.
