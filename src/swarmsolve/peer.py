@@ -170,6 +170,9 @@ class Peer:
             await self.dht.handle(msg, addr)
         elif msg.type in (MessageType.STEAL_REQUEST, MessageType.STEAL_REPLY):
             await self._on_steal_msg(msg, addr)
+        elif msg.type == MessageType.DEAD_END_REPORT:
+            # Point-to-point dead-end report from a child; bypass gossip.
+            await self._on_dead_end_report(msg, addr)
         else:
             await self.gossip.handle(msg)
 
@@ -307,7 +310,12 @@ class Peer:
         owner** (routed by XOR key), so nothing is lost or duplicated — the DHT
         used as a put(task -> owner). ttl=0 means the owner won't re-forward it.
         Otherwise: best-effort gossip (work-stealing tolerates loss/overlap).
+
+        In both modes we stamp ``parent_host`` / ``parent_port`` so the child
+        can later report dead ends directly back to us (hybrid reporting).
         """
+        task.parent_host = self.host
+        task.parent_port = self.port
         payload = {"task": task.to_dict()}
         if self.exclusive and self.owner_roster:
             owner = self._owner_of(task)
@@ -477,13 +485,63 @@ class Peer:
         return False
 
     def _publish_dead_end(self, path: Path) -> None:
-        # Only share shallow, high-value prunings to keep traffic bounded.
+        """Report a dead end.
+
+        Hybrid strategy (see design discussion on parent-child dead-end reporting):
+
+        * If the dead path is a **dispatched child task** (we have a parent
+          address on file for it), report **directly to the parent via TCP**
+          (point-to-point).  The parent marked the task as dispatched and is the
+          only peer that benefits — other peers never explore this exact path,
+          so gossiping it to everyone is pure waste.
+
+        * Otherwise (the peer is solving a task it took from the shared pool and
+          hit a deep dead end that is a prefix of no dispatched child), fall back
+          to gossiping a **shallow** dead end so peers that hold sibling subtasks
+          sharing this prefix can prune early.  Deep dead ends are not worth the
+          bandwidth and are dropped (same policy as before).
+        """
+        tid = path_repr(path)
+        # 1. Mark locally so we don't re-explore.
+        self.scheduler.mark_dead(path)
+        # 2. Try point-to-point report to the parent (if this task has one).
+        claimed = self.scheduler.claimed.get(tid)
+        parent_host = getattr(claimed, "parent_host", None) if claimed else None
+        parent_port = getattr(claimed, "parent_port", None) if claimed else None
+        if parent_host and parent_port:
+            asyncio.create_task(self._report_dead_end_to_parent(path, parent_host, parent_port))
+            return
+        # 3. Fallback: gossip shallow dead ends only.
         if len(path) > self.dead_end_share_depth:
             return
-        self.scheduler.mark_dead(path)
-        # fire-and-forget gossip (we're inside sync DFS)
         asyncio.create_task(
             self.gossip.broadcast(
                 Message(MessageType.DEAD_END, self.id.hex(), {"path": path})
             )
         )
+
+    async def _report_dead_end_to_parent(self, path: Path, host: str, port: int) -> None:
+        """Send a DEAD_END_REPORT straight to the parent peer (point-to-point)."""
+        await self.transport.send_tcp(
+            host, port,
+            Message(
+                MessageType.DEAD_END_REPORT, self.id.hex(),
+                {"path": path, "host": self.host, "port": self.port},
+                ttl=0,
+            ),
+        )
+
+    async def _on_dead_end_report(self, msg: Message, addr) -> None:
+        """Parent receives a dead-end report from a child.
+
+        The child proved ``path`` leads to no solution.  We mark it dead locally
+        so we never dispatch a subtask with that prefix again, and we do NOT
+        re-broadcast (the parent is the only consumer that matters — siblings
+        explore different values at the split cell, so this dead end is
+        irrelevant to them).
+        """
+        path = [tuple(p) for p in msg.payload["path"]]
+        self.scheduler.mark_dead(path)
+        child_id = msg.sender[:8]
+        self.log(f"[{self.id.short()}] dead-end report from [{child_id}] "
+                 f"path={path_repr(path)[:40]}")

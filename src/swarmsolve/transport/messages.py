@@ -32,6 +32,8 @@ class MessageType(str, Enum):
     # --- work stealing (load balancing) ---
     STEAL_REQUEST = "STEAL_REQUEST"  # "Give me a task from your deque"
     STEAL_REPLY = "STEAL_REPLY"      # "Here's a task" (or empty = none available)
+    # --- hybrid dead-end reporting (child -> parent, point-to-point) ---
+    DEAD_END_REPORT = "DEAD_END_REPORT"  # child tells parent "this path is dead"
     # --- discovery (Kademlia over UDP) ---
     PING = "PING"
     PONG = "PONG"
