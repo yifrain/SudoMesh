@@ -10,6 +10,11 @@ Three *application* message types match the project brief:
     SOLUTION   -> the final valid Sudoku solution
 
 Plus the *infrastructure* messages used by discovery / gossip.
+
+Work-stealing notes: WORK_REQUEST / WORK_DONATE travel **directly over TCP**
+(routed to a specific peer), NOT through gossip — they are point-to-point
+coordination, not broadcast. This is true work-donation: an idle peer actively
+asks a busy one for work, and the busy one re-splits its in-flight task.
 """
 
 from __future__ import annotations
@@ -29,6 +34,9 @@ class MessageType(str, Enum):
     # --- task coordination ---
     TASK_CLAIM = "TASK_CLAIM"      # "I'm taking this task" (lease)
     TASK_DONE = "TASK_DONE"        # task fully explored, no solution there
+    # --- work-stealing (dynamic load balancing) ---
+    WORK_REQUEST = "WORK_REQUEST"  # idle peer asks a busy peer for work (TCP)
+    WORK_DONATE = "WORK_DONATE"    # busy peer splits a task and hands part over (TCP)
     # --- discovery (Kademlia over UDP) ---
     PING = "PING"
     PONG = "PONG"

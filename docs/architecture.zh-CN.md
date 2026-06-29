@@ -440,3 +440,52 @@ for p in 1 2 4; do uv run swarmsolve benchmark --file wide.txt --peers $p --node
 求解器与尺寸无关（N = k²）。`swarmsolve gen --size 25` 瞬时构造合法 25×25；高线索实例靠
 约束传播立即解出（`solve` → 1 节点，0.00 秒）。稀疏线索的 25×25 首解搜索是 NP 难（树爆炸），
 因此我们用上面受控的*穷举*基准来量化并行加速，而非单次 25×25 首解运行。
+
+---
+
+## 15. 工作窃取：基于工作捐赠的动态负载均衡（M5+）
+
+之前集群只有*被动*切分（`split_depth` 广播子任务）和*静态*归属（exclusive 模式），
+缺少**真正的工作窃取**：空闲节点主动向忙节点索要工作。现已实现。
+
+### 捐赠协议（点对点，TCP）
+```
+空闲节点                            忙节点（持有在跑任务）
+   |                                      |
+   |-- WORK_REQUEST (TCP, ttl=0) ------->|
+   |                                      | _try_donate():
+   |                                      |   把在跑任务切成子任务
+   |                                      |   退役父任务（mark_done）
+   |                                      |   本地保留 0 号子任务
+   |<---- WORK_DONATE (子任务) -----------|   返回 N 号子任务
+   |                                      |
+纳入 open 池                              在 0 号子任务上继续
+```
+新增两个消息类型 [`WORK_REQUEST`](../src/swarmsolve/transport/messages.py) /
+[`WORK_DONATE`](../src/swarmsolve/transport/messages.py)，**经 TCP 直接传输**
+（不走 gossip）——它们是点对点协调。见
+[`_on_work_steal`](../src/swarmsolve/peer.py) / [`_try_donate`](../src/swarmsolve/peer.py)
+/ [`_maybe_steal`](../src/swarmsolve/peer.py)。
+
+### 为何要退役父任务？
+朴素捐赠（交出一个子任务但继续探索父任务）会导致父与子**重叠** → 重复工作。
+`_try_donate` 改为退役父任务（`mark_done`）并只保留一个子任务，使父+子任务
+无重叠地划分整棵子树。
+
+### 租约续约（防止长任务被重复）
+长 DFS 可能超过租约时长而被其他节点回收重做。现在
+[`_tick_and_should_stop`](../src/swarmsolve/peer.py)（每个搜索节点调用一次）
+会通过 [`Scheduler.renew`](../src/swarmsolve/tasks/scheduler.py) 续约所有在跑任务
+的租约——忙节点不会被误判为死节点。
+
+### 两种负载均衡策略及适用场景
+| 策略 | 标志 | 重复工作 | 计数 | 适用 |
+|------|------|----------|------|------|
+| 精确（静态） | `--exclusive`（默认） | 无 | 精确 | 平衡树 |
+| 工作窃取（动态） | `--work-stealing` | 有（重叠） | 精确（dedup） | 不平衡树、抖动 |
+
+当搜索树**严重倾斜**（某分支远大于其他）、节点否则会空闲时，工作窃取是正解：
+忙节点在运行时把工作让给空闲节点。树均匀且要零重复时，精确模式更好。复现：
+```bash
+uv run swarmsolve benchmark --file wide.txt --peers 4 --work-stealing
+```

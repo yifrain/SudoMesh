@@ -487,3 +487,57 @@ The solver is size-generic (N = k²). `swarmsolve gen --size 25` builds a valid
 (`solve` → 1 node, 0.00 s). Full first-solution search of sparsely-clued 25×25 is
 NP-hard (the tree explodes), so we quantify the parallel speedup on the controlled
 *exhaustive* benchmark above rather than on a single 25×25 first-solution run.
+
+---
+
+## 15. Work-stealing: dynamic load balancing via work-donation (M5+)
+
+Earlier the swarm had only *passive* splitting (`split_depth` broadcasts child
+tasks) and *static* ownership (exclusive mode). It lacked **true work-stealing**:
+an idle peer actively asking a busy one for work. This is now implemented.
+
+### The donation protocol (point-to-point, TCP)
+```
+idle peer                          busy peer (has an in-flight task)
+   |                                      |
+   |-- WORK_REQUEST (TCP, ttl=0) ------->|
+   |                                      | _try_donate():
+   |                                      |   split in-flight task into children
+   |                                      |   retire the PARENT (mark_done)
+   |                                      |   keep child #0 locally
+   |<---- WORK_DONATE (child task) ------|   return child #N
+   |                                      |
+adopt into open pool                      continue on child #0
+```
+Two new message types, [`WORK_REQUEST`](../src/swarmsolve/transport/messages.py) /
+[`WORK_DONATE`](../src/swarmsolve/transport/messages.py), travel **directly over
+TCP** (not gossip) — they are point-to-point coordination. See
+[`_on_work_steal`](../src/swarmsolve/peer.py) / [`_try_donate`](../src/swarmsolve/peer.py)
+/ [`_maybe_steal`](../src/swarmsolve/peer.py).
+
+### Why retire the parent?
+A naive donation (hand out a child but keep exploring the parent) causes the
+parent and child to **overlap** -> duplicate work. Instead `_try_donate` retires
+the parent (`mark_done`) and keeps exactly one child, so the parent + children
+partition the subtree with no overlap.
+
+### Lease renewal (prevents duplicate work on long tasks)
+A long DFS could outlast its lease and be reclaimed (re-done) by another peer.
+Now [`_tick_and_should_stop`](../src/swarmsolve/peer.py) (called once per search
+node) renews the lease on every in-flight task via
+[`Scheduler.renew`](../src/swarmsolve/tasks/scheduler.py) — so a busy peer is
+never mistaken for a dead one.
+
+### Two load-balancing strategies, when to use each
+| Strategy | Flag | Duplicate work | Counts | Best when |
+|----------|------|----------------|--------|-----------|
+| Exclusive (static) | `--exclusive` (default) | none | exact | balanced trees |
+| Work-stealing (dynamic) | `--work-stealing` | some (overlap) | exact (dedup) | unbalanced trees, churn |
+
+Work-stealing is the right answer when the search tree is **lopsided** (one
+branch far bigger) and peers would otherwise idle: busy peers shed work to idle
+ones at runtime. Exclusive is better when the tree is uniform and you want
+zero duplication. Reproduce:
+```bash
+uv run swarmsolve benchmark --file wide.txt --peers 4 --work-stealing
+```

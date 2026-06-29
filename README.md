@@ -334,10 +334,11 @@ signatures (see the docstrings in each module).
   and churn-tolerant, exactly as Kademlia is used in practice (BitTorrent, IPFS).
 * **MVP on 16×16 first** — same architecture as 25×25, but fast enough to iterate
   and demo; scaling up is just a parameter.
-* **Work-stealing (`split_depth`)** — shallow tasks are re-split into finer
-  OPEN_TASKs and re-gossiped, so the grain adapts to the swarm and idle peers get
-  work. Deeper splitting balances load but adds duplicate work — a classic
-  distributed-search trade-off (see [`docs/`](docs/README.md) §8).
+* **Two load-balancing strategies** — (1) passive `split_depth` re-splitting +
+  gossip; (2) **true work-stealing** (`--work-stealing`): idle peers actively
+  request work from busy peers over point-to-point TCP (WORK_REQUEST/WORK_DONATE),
+  which re-splits an in-flight task and donates a child. Leases are renewed on
+  long tasks so a busy peer is never reclaimed. See [`docs/`](docs/README.md) §15.
 * **Newline-delimited JSON on the wire** — readable for debugging/demo; can be
   swapped for msgpack without touching call sites.
 
@@ -635,9 +636,10 @@ uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
 * **发现用 Kademlia（UDP）+ 任务用 TCP**：既满足作业"TCP 消息"传重要/可靠负载，
   又让发现轻量、抗抖动——正是 Kademlia 在工业界（BitTorrent、IPFS）的用法。
 * **MVP 先做 16×16**：架构与 25×25 完全一致，但迭代/演示更快；放大只是改参数。
-* **工作窃取（`split_depth`）**：浅任务会被再切分成更细的 OPEN_TASK 并重新 gossip，
-  使粒度自适应集群、让空闲节点有活干。切得越深负载越均衡但重复工作越多——这是分布式
-  搜索的经典权衡（详见 [`docs/`](docs/README.md) 第 8 节）。
+* **两种负载均衡策略**：(1) 被动 `split_depth` 再切分 + gossip；(2) **真正的工作窃取**
+  （`--work-stealing`）：空闲节点经点对点 TCP（WORK_REQUEST/WORK_DONATE）主动向忙节点索要
+  工作，忙节点切分在跑任务并捐赠一个子任务。长任务会续约租约，忙节点不会被误回收。
+  详见 [`docs/`](docs/README.md) 第 15 节。
 * **线上用换行分隔 JSON**：便于调试/演示；可无痛替换为 msgpack。
 
 ---
@@ -934,7 +936,8 @@ uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
 * **探索用 Kademlia（UDP）+ 任務用 TCP**：既滿足作業「TCP 訊息」傳重要/可靠負載，
   又讓探索輕量、抗抖動——正是 Kademlia 在工業界（BitTorrent、IPFS）的用法。
 * **MVP 先做 16×16**：架構與 25×25 完全一致，但迭代/演示更快；放大只是改參數。
-* **工作竊取（`split_depth`）**：淺任務會被再切分成更細的 OPEN_TASK 並重新 gossip，
-  使粒度自適應叢集、讓閒置節點有事可做。切得越深負載越平衡但重複工作越多——這是分散式
-  搜尋的經典取捨（詳見 [`docs/`](docs/README.md) 第 8 節）。
+* **兩種負載平衡策略**：(1) 被動 `split_depth` 再切分 + gossip；(2) **真正的工作竊取**
+  （`--work-stealing`）：閒置節點經點對點 TCP（WORK_REQUEST/WORK_DONATE）主動向忙節點
+  索要工作，忙節點切分在跑任務並捐贈一個子任務。長任務會續約租約，忙節點不會被誤回收。
+  詳見 [`docs/`](docs/README.md) 第 15 節。
 * **線上用換行分隔 JSON**：便於除錯/演示；可無痛替換為 msgpack。

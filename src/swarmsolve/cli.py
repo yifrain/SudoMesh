@@ -67,6 +67,7 @@ def _peer_worker(
             enumerate_mode=cfg.get("enumerate", False),
             idle_limit=cfg.get("idle_limit", 30),
             exclusive=cfg.get("exclusive", False),
+            work_stealing=cfg.get("work_stealing", False),
             owner_roster=(
                 [(NodeID.from_string(f"127.0.0.1:{BASE_PORT + r}#vn{v}"),
                   Contact(NodeID.from_string(f"127.0.0.1:{BASE_PORT + r}"),
@@ -193,8 +194,11 @@ def demo(
     node_delay: float = typer.Option(
         0.003, help="Per-node cost (s); models expensive search so speedup shows"
     ),
-    split_depth: int = typer.Option(2, help="Work-stealing: re-split tasks below this depth"),
+    split_depth: int = typer.Option(2, help="Re-split tasks below this depth"),
     lease: float = typer.Option(5.0, help="Task lease seconds"),
+    work_stealing: bool = typer.Option(
+        False, help="Idle peers actively request work from busy peers (dynamic LB)"
+    ),
     seed: int = typer.Option(0, help="RNG seed for generation"),
 ) -> None:
     """Run a real local P2P swarm and compare it to the single-machine baseline."""
@@ -202,7 +206,7 @@ def demo(
     target = tasks or (peers * 2)
     n = board.n
     console.print(f"[bold]Puzzle {n}x{n}, peers={peers}, node_delay={node_delay}s, "
-                  f"split_depth={split_depth}[/]")
+                  f"split_depth={split_depth}, work_stealing={work_stealing}[/]")
     console.print(str(board))
 
     console.print("\n[bold]1) Single-machine baseline[/]")
@@ -213,7 +217,7 @@ def demo(
 
     console.print("\n[bold]2) P2P swarm[/]")
     cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
-           "settle": 0.6, "report": False}
+           "settle": 0.6, "report": False, "work_stealing": work_stealing}
     procs, q = _spawn(peers, n, board.to_flat(), target, cfg)
     swarm_t0 = time.perf_counter()
     results = _collect(procs, q)
@@ -272,6 +276,10 @@ def benchmark(
         True, help="Deterministic single-owner execution (no duplicate work)"
     ),
     vnodes: int = typer.Option(16, help="Virtual nodes per peer (load smoothing)"),
+    work_stealing: bool = typer.Option(
+        False, help="Idle peers actively request work from busy peers (dynamic LB). "
+                    "Implies non-exclusive (work-donation tolerates overlap)."
+    ),
     seed: int = typer.Option(0, help="RNG seed for generation"),
 ) -> None:
     """Exhaustively explore the whole tree (count all solutions / prove uniqueness).
@@ -280,11 +288,20 @@ def benchmark(
     workload is embarrassingly parallel, so the swarm shows near-linear speedup.
     """
     board = _load_or_generate(file, size, seed)
+    # work-stealing is a dynamic-LB strategy that needs overlap tolerance, so it
+    # overrides exclusive. Otherwise exclusive (static, single-owner) is default.
+    if work_stealing:
+        exclusive = False
     # Exclusive distributes statically at submit time → seed a finer frontier for
     # balance; work-stealing refines at runtime from a coarse seed.
     target = peers * 64 if exclusive else peers * 2
     n = board.n
-    mode = "exclusive (single-owner)" if exclusive else "work-stealing (may duplicate)"
+    if exclusive:
+        mode = "exclusive (single-owner + vnodes)"
+    elif work_stealing:
+        mode = "work-stealing (donation, dynamic LB)"
+    else:
+        mode = "gossip (best-effort)"
     console.print(f"[bold]Exhaustive benchmark: {n}x{n}, peers={peers}, "
                   f"node_delay={node_delay}s, mode={mode}[/]")
 
@@ -298,7 +315,8 @@ def benchmark(
     console.print("\n[bold]2) P2P swarm (full tree)[/]")
     cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
            "settle": 0.5, "report": False, "enumerate": True, "vnodes": vnodes,
-           "exclusive": exclusive, "idle_limit": 30 if exclusive else 60}
+           "exclusive": exclusive, "work_stealing": work_stealing,
+           "idle_limit": 30 if exclusive else 60}
     procs, q = _spawn(peers, n, board.to_flat(), target, cfg)
     swarm_t0 = time.perf_counter()
     results = _collect(procs, q)
@@ -372,18 +390,21 @@ def dashboard(
     peers: int = typer.Option(4, help="Number of peers (processes)"),
     tasks: int = typer.Option(0, help="Target #subtasks to seed (0 = 2*peers)"),
     node_delay: float = typer.Option(0.01, help="Per-node cost (s) for a visible pace"),
-    split_depth: int = typer.Option(2, help="Work-stealing depth"),
+    split_depth: int = typer.Option(2, help="Re-split tasks below this depth"),
     lease: float = typer.Option(6.0, help="Task lease seconds"),
+    work_stealing: bool = typer.Option(
+        True, help="Idle peers actively request work from busy peers (watch LB in action)"
+    ),
     seed: int = typer.Option(0, help="RNG seed for generation"),
 ) -> None:
     """Run the swarm with a live dashboard of per-peer task counters."""
     board = _load_or_generate(file, size, seed)
     target = tasks or (peers * 2)
     n = board.n
-    console.print(f"[bold]Live swarm: {n}x{n}, peers={peers}[/]")
+    console.print(f"[bold]Live swarm: {n}x{n}, peers={peers}, work_stealing={work_stealing}[/]")
 
     cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
-           "settle": 0.6, "report": True}
+           "settle": 0.6, "report": True, "work_stealing": work_stealing}
     procs, q = _spawn(peers, n, board.to_flat(), target, cfg)
 
     stats: dict = {}
@@ -467,9 +488,10 @@ def peer(
     submit: bool = typer.Option(False, help="Seed the task frontier from this peer"),
     tasks: int = typer.Option(16, help="Target #subtasks to seed when --submit"),
     node_delay: float = typer.Option(0.0, help="Artificial per-node cost (demo)"),
-    split_depth: int = typer.Option(0, help="Work-stealing depth (0 = off)"),
+    split_depth: int = typer.Option(0, help="Re-split tasks below this depth (0 = off)"),
     lease: float = typer.Option(10.0, help="Task lease seconds"),
     idle_limit: int = typer.Option(30, help="Idle polls before giving up (higher = wait longer for tasks)"),
+    work_stealing: bool = typer.Option(False, help="Actively request work when idle"),
 ) -> None:
     """Launch one real peer (use several terminals / machines for a live demo)."""
     board = load_board(file)
@@ -477,7 +499,7 @@ def peer(
     async def main() -> None:
         p = Peer("0.0.0.0", port, board, log=console.print,
                  node_delay=node_delay, split_depth=split_depth, lease_seconds=lease,
-                 idle_limit=idle_limit)
+                 idle_limit=idle_limit, work_stealing=work_stealing)
         boot = None
         if bootstrap:
             host, bport = bootstrap.split(":")
