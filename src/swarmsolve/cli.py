@@ -489,11 +489,35 @@ def peer(
             await asyncio.sleep(1.0)     # let gossip propagate to joiners
         else:
             await asyncio.sleep(1.0)
-        sol = await p.run()
-        if sol:
-            console.print("[green]Solution:[/]")
-            console.print(str(sol))
-        await p.stop()
+
+        # Graceful leave on Ctrl+C: hand off tasks + notify neighbours.
+        loop = asyncio.get_running_loop()
+        leaving = asyncio.Event()
+
+        def _on_sigint() -> None:
+            console.print("[yellow]Received Ctrl+C, graceful leave...[/]")
+            leaving.set()
+            p._stop.set()  # also break the work loop
+
+        import signal
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _on_sigint)
+            except NotImplementedError:
+                pass  # Windows
+
+        # Run the work loop; if a signal fired we do graceful leave.
+        sol_task = asyncio.create_task(p.run())
+        await asyncio.wait({sol_task, asyncio.create_task(leaving.wait())},
+                           return_when=asyncio.FIRST_COMPLETED)
+        if leaving.is_set():
+            await p.graceful_leave()
+        else:
+            sol = sol_task.result()
+            if sol:
+                console.print("[green]Solution:[/]")
+                console.print(str(sol))
+            await p.stop()
 
     asyncio.run(main())
 

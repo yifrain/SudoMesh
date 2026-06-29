@@ -34,6 +34,8 @@ class MessageType(str, Enum):
     STEAL_REPLY = "STEAL_REPLY"      # "Here's a task" (or empty = none available)
     # --- hybrid dead-end reporting (child -> parent, point-to-point) ---
     DEAD_END_REPORT = "DEAD_END_REPORT"  # child tells parent "this path is dead"
+    # --- dynamic membership ---
+    LEAVE_ANNOUNCE = "LEAVE_ANNOUNCE"  # "I'm leaving; drop me from your routing table"
     # --- discovery (Kademlia over UDP) ---
     PING = "PING"
     PONG = "PONG"

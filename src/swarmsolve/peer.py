@@ -64,6 +64,7 @@ class Peer:
         self.dht = KademliaNode(self.id, self.transport)
         self.gossip = Gossip(self.transport, self.dht.table)
         self.scheduler = Scheduler(self.id, lease_seconds=lease_seconds)
+        self.lease_seconds = lease_seconds
         self.log = log
         # Only *shallow* dead ends are worth sharing: deep leaf dead-ends are
         # too numerous and too specific to help other peers. This keeps gossip
@@ -106,6 +107,10 @@ class Peer:
         self._pending_steals: dict[str, asyncio.Future] = {}
         self.steals_attempted = 0
         self.steals_succeeded = 0
+        # Dynamic membership: refresh round counter for periodic bucket refresh.
+        # Every ~5s of idle/work we re-run FIND_NODE(self) so newly joined peers
+        # are discovered and dead peers are routed around.
+        self._refresh_round = 0
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -119,11 +124,51 @@ class Peer:
                  f"(peers={self.dht.table.size()})")
 
     async def stop(self) -> None:
+        """Hard stop: close transport immediately (no notification)."""
         self._stop.set()
         await self.transport.stop()
 
-    def contact(self) -> Contact:
-        return Contact(self.id, self.host, self.port)
+    async def graceful_leave(self) -> None:
+        """Graceful leave: hand off open tasks, notify neighbours, then stop.
+
+        Called when the peer is shutting down on purpose (e.g. Ctrl+C).  This
+        avoids the 10s lease-expiry window where the peer's tasks are stuck:
+
+        1. Re-broadcast all open tasks in our deque so others can pick them up.
+        2. Send LEAVE_ANNOUNCE to every known peer so they drop us from their
+           routing tables immediately (no waiting for a PING timeout).
+        3. Close the transport.
+        """
+        self._stop.set()
+        self.log(f"[{self.id.short()}] graceful leave: handing off "
+                 f"{self.scheduler.task_deque.__len__()} open tasks")
+        # 1. Hand off open tasks via gossip.
+        for task in list(self.scheduler.task_deque):
+            payload = {"task": task.to_dict()}
+            try:
+                await self.gossip.broadcast(
+                    Message(MessageType.OPEN_TASK, self.id.hex(), payload)
+                )
+            except Exception:
+                pass
+        # 2. Announce departure to all known peers (point-to-point TCP).
+        leave_msg = Message(MessageType.LEAVE_ANNOUNCE, self.id.hex(), ttl=0)
+        for c in self.dht.table.all_contacts():
+            try:
+                await self.transport.send_tcp(c.host, c.port, leave_msg)
+            except Exception:
+                pass
+        # 3. Stop transport.
+        await self.transport.stop()
+
+    async def _refresh_routing(self) -> None:
+        """Periodically re-run FIND_NODE(self) to discover new peers and route
+        around dead ones.  This is what makes the overlay *dynamic*: a peer
+        that joins mid-solve is found within ~5s instead of never."""
+        try:
+            await self.dht.lookup(self.id)
+        except Exception:
+            pass
 
     # ---- observability ------------------------------------------------
 
@@ -173,6 +218,12 @@ class Peer:
         elif msg.type == MessageType.DEAD_END_REPORT:
             # Point-to-point dead-end report from a child; bypass gossip.
             await self._on_dead_end_report(msg, addr)
+        elif msg.type == MessageType.LEAVE_ANNOUNCE:
+            # A peer is leaving gracefully; drop it from our routing table.
+            leaver_id = NodeID.from_hex(msg.sender)
+            self.dht.table.remove(leaver_id)
+            self.log(f"[{self.id.short()}] peer [{leaver_id.short()}] left; "
+                     f"peers={self.dht.table.size()}")
         else:
             await self.gossip.handle(msg)
 
@@ -364,6 +415,11 @@ class Peer:
         self.log(f"[{self.id.short()}] waiting for tasks...")
         while not self._stop.is_set():
             self._maybe_tick()                      # refresh the live dashboard
+            # Periodic bucket refresh (~every 5s): discover newly joined peers
+            # and route around dead ones.  Runs whether idle or busy.
+            self._refresh_round += 1
+            if self._refresh_round % 167 == 0 and self.dht.table.size() > 0:
+                asyncio.create_task(self._refresh_routing())
             task = self._pick_task()                # O(1) pop from deque tail
             if task is None:
                 idle_rounds += 1
@@ -473,8 +529,16 @@ class Peer:
     # ---- pruning / cancel hooks ---------------------------------------
 
     def _tick_and_should_stop(self) -> bool:
-        # Called once per search node: cheap place to refresh the dashboard.
+        # Called once per search node: cheap place to refresh the dashboard and
+        # renew our lease so the task isn't reclaimed while we're still working.
         self._maybe_tick()
+        # Renew the lease on our current claimed task every ~1s of search work.
+        # This prevents false reclaim during long DFS runs (lease is short for
+        # fast crash detection; renewal keeps live peers from being evicted).
+        for task in self.scheduler.claimed.values():
+            if task.owner == self.id.hex() and task.lease_expires - time.time() < self.lease_seconds * 0.5:
+                self.scheduler.renew(task)
+                break
         return self._stop.is_set()
 
     def _is_dead_end(self, path: Path) -> bool:

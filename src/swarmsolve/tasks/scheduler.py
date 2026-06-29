@@ -28,7 +28,7 @@ from swarmsolve.discovery.node_id import NodeID, xor_distance
 from swarmsolve.solver.search import Path
 from swarmsolve.tasks.task import Task, TaskStatus, path_repr
 
-DEFAULT_LEASE_SECONDS = 10.0
+DEFAULT_LEASE_SECONDS = 5.0  # short for fast crash detection; renewed while working
 
 
 class Scheduler:
