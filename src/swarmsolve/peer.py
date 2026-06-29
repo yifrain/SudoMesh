@@ -101,6 +101,11 @@ class Peer:
         self.nodes_expanded = 0
         self.tasks_done = 0
         self._bootstrap_contacts: list[Contact] = []
+        # Work stealing: pending steal requests keyed by msg_id, holding a Future
+        # that resolves to the stolen Task (or None if the victim had no work).
+        self._pending_steals: dict[str, asyncio.Future] = {}
+        self.steals_attempted = 0
+        self.steals_succeeded = 0
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -150,7 +155,9 @@ class Peer:
     async def _dispatch(self, msg: Message, addr, kind: str) -> None:
         """Single inbound entry point for EVERY message this peer receives.
 
-        Routes by category: Kademlia RPCs go straight to the DHT; all
+        Routes by category: Kademlia RPCs go straight to the DHT; work-stealing
+        RPCs (STEAL_REQUEST / STEAL_REPLY) are handled point-to-point (no gossip
+        de-dup, since each is a direct request/response pair); all other
         application + coordination traffic goes through gossip, which de-dups,
         delivers locally (``_on_gossip``) and re-forwards to neighbours.
         """
@@ -161,8 +168,60 @@ class Peer:
             MessageType.FIND_NODE_REPLY,
         ):
             await self.dht.handle(msg, addr)
+        elif msg.type in (MessageType.STEAL_REQUEST, MessageType.STEAL_REPLY):
+            await self._on_steal_msg(msg, addr)
         else:
             await self.gossip.handle(msg)
+
+    # ---- work stealing (load balancing) -------------------------------
+
+    async def _try_steal(self) -> None:
+        """Idle peer: ask a random neighbour for a task from its deque head."""
+        import random as _random
+        peers = self.dht.table.all_contacts()
+        if not peers:
+            return
+        victim = _random.choice(peers)
+        self.steals_attempted += 1
+        msg = Message(
+            MessageType.STEAL_REQUEST, self.id.hex(),
+            {"host": self.host, "port": self.port}, ttl=0,
+        )
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_steals[msg.msg_id] = fut
+        await self.transport.send_tcp(victim.host, victim.port, msg)
+        try:
+            stolen = await asyncio.wait_for(fut, timeout=1.0)
+        except asyncio.TimeoutError:
+            self._pending_steals.pop(msg.msg_id, None)
+            return
+        if stolen is not None:
+            self.steals_succeeded += 1
+            task = Task.from_dict(stolen)
+            self.scheduler.add_open(task)
+            self.log(f"[{self.id.short()}] stole task (depth={task.depth}) "
+                     f"from [{victim.node_id.short()}]")
+
+    async def _on_steal_msg(self, msg: Message, addr) -> None:
+        """Handle a STEAL_REQUEST (give work) or STEAL_REPLY (receive work)."""
+        if msg.type == MessageType.STEAL_REQUEST:
+            # A peer is asking us for work: give it one task from our head (FIFO).
+            stolen = self.scheduler.steal()
+            reply_payload = {"task": stolen.to_dict()} if stolen else {}
+            host = msg.payload.get("host", addr[0])
+            port = msg.payload.get("port", addr[1])
+            await self.transport.send_tcp(
+                host, port,
+                Message(
+                    MessageType.STEAL_REPLY, self.id.hex(),
+                    reply_payload, ttl=0,
+                ),
+            )
+        elif msg.type == MessageType.STEAL_REPLY:
+            fut = self._pending_steals.pop(msg.msg_id, None)
+            if fut and not fut.done():
+                task_dict = msg.payload.get("task")
+                fut.set_result(task_dict)
 
     async def _on_gossip(self, msg: Message) -> None:
         """Receiving end of every application link: apply one delivered message
@@ -266,14 +325,22 @@ class Peer:
             )
 
     def _pick_task(self) -> Task | None:
-        """Pick the best open task: closest-to-my-ID, optionally owner-filtered."""
+        """Pick the next task to work on: O(1) pop from the deque tail (LIFO).
+
+        In exclusive mode we must only run tasks we own; we scan the deque from
+        the tail and pick the first owned task (still cheap when the pool is
+        small — exclusive mode seeds a bounded frontier).
+        """
         self.scheduler.reclaim_expired()
-        pool = list(self.scheduler.open.values())
-        if self.exclusive:
-            pool = [t for t in pool if self._owns(t)]
-        if not pool:
-            return None
-        return min(pool, key=lambda t: xor_distance(self.id, t.key))
+        if not self.exclusive:
+            return self.scheduler.pop_own()
+        # Exclusive: find first owned task from the tail.
+        for task in reversed(self.scheduler.task_deque):
+            if self._owns(task) and self.scheduler._is_pickable(task):
+                self.scheduler.task_deque.remove(task)
+                self.scheduler.task_map.pop(task.id, None)
+                return task
+        return None
 
     # ---- the work loop ------------------------------------------------
 
@@ -285,10 +352,11 @@ class Peer:
         gives a crashed peer's lease time to expire so its task is reclaimed.
         """
         idle_rounds = 0
+        steal_rounds = 0
         self.log(f"[{self.id.short()}] waiting for tasks...")
         while not self._stop.is_set():
             self._maybe_tick()                      # refresh the live dashboard
-            task = self._pick_task()                # closest-to-me, owner-filtered
+            task = self._pick_task()                # O(1) pop from deque tail
             if task is None:
                 idle_rounds += 1
                 if idle_rounds == 1:
@@ -297,12 +365,17 @@ class Peer:
                 if self._bootstrap_contacts and idle_rounds % 30 == 0:
                     self.log(f"[{self.id.short()}] re-bootstrapping to find submitter...")
                     await self.dht.bootstrap(self._bootstrap_contacts)
+                # Work stealing: every ~0.5s when idle, ask a random peer for work
+                if idle_rounds % 15 == 0 and self.dht.table.size() > 0:
+                    steal_rounds += 1
+                    await self._try_steal()
                 if idle_rounds > self.idle_limit:   # quiescent -> we're done
                     self.log(f"[{self.id.short()}] no tasks after {self.idle_limit} polls, exiting")
                     break
                 await asyncio.sleep(0.03)           # wait for tasks to arrive
                 continue
             idle_rounds = 0
+            steal_rounds = 0
             self.log(f"[{self.id.short()}] claiming task (depth={task.depth}, "
                      f"nodes_so_far={self.nodes_expanded})")
             await self._work_on(task)               # claim -> split/solve -> gossip

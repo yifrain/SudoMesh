@@ -29,6 +29,9 @@ class MessageType(str, Enum):
     # --- task coordination ---
     TASK_CLAIM = "TASK_CLAIM"      # "I'm taking this task" (lease)
     TASK_DONE = "TASK_DONE"        # task fully explored, no solution there
+    # --- work stealing (load balancing) ---
+    STEAL_REQUEST = "STEAL_REQUEST"  # "Give me a task from your deque"
+    STEAL_REPLY = "STEAL_REPLY"      # "Here's a task" (or empty = none available)
     # --- discovery (Kademlia over UDP) ---
     PING = "PING"
     PONG = "PONG"
