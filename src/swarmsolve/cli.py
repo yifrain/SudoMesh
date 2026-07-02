@@ -277,8 +277,8 @@ def benchmark(
     ),
     vnodes: int = typer.Option(16, help="Virtual nodes per peer (load smoothing)"),
     work_stealing: bool = typer.Option(
-        False, help="Idle peers actively request work from busy peers (dynamic LB). "
-                    "Implies non-exclusive (work-donation tolerates overlap)."
+        False, help="Idle peers steal tasks from a busy peer's deque head (Chase-Lev "
+                    "dynamic LB). Implies non-exclusive (stealing tolerates overlap)."
     ),
     seed: int = typer.Option(0, help="RNG seed for generation"),
 ) -> None:
@@ -299,7 +299,7 @@ def benchmark(
     if exclusive:
         mode = "exclusive (single-owner + vnodes)"
     elif work_stealing:
-        mode = "work-stealing (donation, dynamic LB)"
+        mode = "work-stealing (Chase-Lev deque, dynamic LB)"
     else:
         mode = "gossip (best-effort)"
     console.print(f"[bold]Exhaustive benchmark: {n}x{n}, peers={peers}, "
@@ -511,11 +511,35 @@ def peer(
             await asyncio.sleep(1.0)     # let gossip propagate to joiners
         else:
             await asyncio.sleep(1.0)
-        sol = await p.run()
-        if sol:
-            console.print("[green]Solution:[/]")
-            console.print(str(sol))
-        await p.stop()
+
+        # Graceful leave on Ctrl+C: hand off tasks + notify neighbours.
+        loop = asyncio.get_running_loop()
+        leaving = asyncio.Event()
+
+        def _on_sigint() -> None:
+            console.print("[yellow]Received Ctrl+C, graceful leave...[/]")
+            leaving.set()
+            p._stop.set()  # also break the work loop
+
+        import signal
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _on_sigint)
+            except NotImplementedError:
+                pass  # Windows
+
+        # Run the work loop; if a signal fired we do graceful leave.
+        sol_task = asyncio.create_task(p.run())
+        await asyncio.wait({sol_task, asyncio.create_task(leaving.wait())},
+                           return_when=asyncio.FIRST_COMPLETED)
+        if leaving.is_set():
+            await p.graceful_leave()
+        else:
+            sol = sol_task.result()
+            if sol:
+                console.print("[green]Solution:[/]")
+                console.print(str(sol))
+            await p.stop()
 
     asyncio.run(main())
 

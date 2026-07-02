@@ -18,7 +18,6 @@ Owner: Person E (orchestration) — uses every other member's module.
 from __future__ import annotations
 
 import asyncio
-import random
 import time
 
 from swarmsolve.discovery.kademlia import KademliaNode
@@ -55,7 +54,6 @@ class Peer:
         exclusive: bool = False,
         owner_roster: list[tuple[NodeID, Contact]] | None = None,
         work_stealing: bool = False,
-        steal_interval: float = 0.5,
         on_tick=None,
         tick_interval: float = 0.15,
     ) -> None:
@@ -67,6 +65,7 @@ class Peer:
         self.dht = KademliaNode(self.id, self.transport)
         self.gossip = Gossip(self.transport, self.dht.table)
         self.scheduler = Scheduler(self.id, lease_seconds=lease_seconds)
+        self.lease_seconds = lease_seconds
         self.log = log
         # Only *shallow* dead ends are worth sharing: deep leaf dead-ends are
         # too numerous and too specific to help other peers. This keeps gossip
@@ -93,16 +92,11 @@ class Peer:
         # if None we fall back to the Kademlia routing table (decentralized).
         self.exclusive = exclusive
         self.owner_roster = owner_roster
-        # True work-stealing: an IDLE peer actively asks BUSY peers for work
-        # (WORK_REQUEST -> the busy peer re-splits its in-flight task and DONATEs
-        # part of it). This is dynamic load balancing that both modes benefit from,
-        # unlike passive split_depth broadcasting. Off by default (use --work-stealing).
+        # True work-stealing (Chase-Lev / Cilk deque): when idle, actively STEAL
+        # the oldest (coarsest) task from a busy peer's deque head, giving dynamic
+        # load balancing beyond the passive split_depth broadcasting. When off,
+        # peers only get work from the initial push + gossip. See ``_try_steal``.
         self.work_stealing = work_stealing
-        self.steal_interval = steal_interval
-        self._last_steal = 0.0
-        # Tasks this peer is actively solving (path -> start time). Used to decide
-        # whom to steal from and to renew leases on long tasks.
-        self._inflight: dict[str, float] = {}
 
         # Observability hook (used by the live dashboard).
         self.on_tick = on_tick
@@ -114,6 +108,15 @@ class Peer:
         self.nodes_expanded = 0
         self.tasks_done = 0
         self._bootstrap_contacts: list[Contact] = []
+        # Work stealing: pending steal requests keyed by msg_id, holding a Future
+        # that resolves to the stolen Task (or None if the victim had no work).
+        self._pending_steals: dict[str, asyncio.Future] = {}
+        self.steals_attempted = 0
+        self.steals_succeeded = 0
+        # Dynamic membership: refresh round counter for periodic bucket refresh.
+        # Every ~5s of idle/work we re-run FIND_NODE(self) so newly joined peers
+        # are discovered and dead peers are routed around.
+        self._refresh_round = 0
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -127,11 +130,51 @@ class Peer:
                  f"(peers={self.dht.table.size()})")
 
     async def stop(self) -> None:
+        """Hard stop: close transport immediately (no notification)."""
         self._stop.set()
         await self.transport.stop()
 
-    def contact(self) -> Contact:
-        return Contact(self.id, self.host, self.port)
+    async def graceful_leave(self) -> None:
+        """Graceful leave: hand off open tasks, notify neighbours, then stop.
+
+        Called when the peer is shutting down on purpose (e.g. Ctrl+C).  This
+        avoids the 10s lease-expiry window where the peer's tasks are stuck:
+
+        1. Re-broadcast all open tasks in our deque so others can pick them up.
+        2. Send LEAVE_ANNOUNCE to every known peer so they drop us from their
+           routing tables immediately (no waiting for a PING timeout).
+        3. Close the transport.
+        """
+        self._stop.set()
+        self.log(f"[{self.id.short()}] graceful leave: handing off "
+                 f"{self.scheduler.task_deque.__len__()} open tasks")
+        # 1. Hand off open tasks via gossip.
+        for task in list(self.scheduler.task_deque):
+            payload = {"task": task.to_dict()}
+            try:
+                await self.gossip.broadcast(
+                    Message(MessageType.OPEN_TASK, self.id.hex(), payload)
+                )
+            except Exception:
+                pass
+        # 2. Announce departure to all known peers (point-to-point TCP).
+        leave_msg = Message(MessageType.LEAVE_ANNOUNCE, self.id.hex(), ttl=0)
+        for c in self.dht.table.all_contacts():
+            try:
+                await self.transport.send_tcp(c.host, c.port, leave_msg)
+            except Exception:
+                pass
+        # 3. Stop transport.
+        await self.transport.stop()
+
+    async def _refresh_routing(self) -> None:
+        """Periodically re-run FIND_NODE(self) to discover new peers and route
+        around dead ones.  This is what makes the overlay *dynamic*: a peer
+        that joins mid-solve is found within ~5s instead of never."""
+        try:
+            await self.dht.lookup(self.id)
+        except Exception:
+            pass
 
     # ---- observability ------------------------------------------------
 
@@ -163,7 +206,9 @@ class Peer:
     async def _dispatch(self, msg: Message, addr, kind: str) -> None:
         """Single inbound entry point for EVERY message this peer receives.
 
-        Routes by category: Kademlia RPCs go straight to the DHT; all
+        Routes by category: Kademlia RPCs go straight to the DHT; work-stealing
+        RPCs (STEAL_REQUEST / STEAL_REPLY) are handled point-to-point (no gossip
+        de-dup, since each is a direct request/response pair); all other
         application + coordination traffic goes through gossip, which de-dups,
         delivers locally (``_on_gossip``) and re-forwards to neighbours.
         """
@@ -174,11 +219,69 @@ class Peer:
             MessageType.FIND_NODE_REPLY,
         ):
             await self.dht.handle(msg, addr)
-        elif msg.type in (MessageType.WORK_REQUEST, MessageType.WORK_DONATE):
-            # Point-to-point work-stealing coordination (not broadcast gossip).
-            await self._on_work_steal(msg, addr)
+        elif msg.type in (MessageType.STEAL_REQUEST, MessageType.STEAL_REPLY):
+            await self._on_steal_msg(msg, addr)
+        elif msg.type == MessageType.DEAD_END_REPORT:
+            # Point-to-point dead-end report from a child; bypass gossip.
+            await self._on_dead_end_report(msg, addr)
+        elif msg.type == MessageType.LEAVE_ANNOUNCE:
+            # A peer is leaving gracefully; drop it from our routing table.
+            leaver_id = NodeID.from_hex(msg.sender)
+            self.dht.table.remove(leaver_id)
+            self.log(f"[{self.id.short()}] peer [{leaver_id.short()}] left; "
+                     f"peers={self.dht.table.size()}")
         else:
             await self.gossip.handle(msg)
+
+    # ---- work stealing (load balancing) -------------------------------
+
+    async def _try_steal(self) -> None:
+        """Idle peer: ask a random neighbour for a task from its deque head."""
+        import random as _random
+        peers = self.dht.table.all_contacts()
+        if not peers:
+            return
+        victim = _random.choice(peers)
+        self.steals_attempted += 1
+        msg = Message(
+            MessageType.STEAL_REQUEST, self.id.hex(),
+            {"host": self.host, "port": self.port}, ttl=0,
+        )
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_steals[msg.msg_id] = fut
+        await self.transport.send_tcp(victim.host, victim.port, msg)
+        try:
+            stolen = await asyncio.wait_for(fut, timeout=1.0)
+        except asyncio.TimeoutError:
+            self._pending_steals.pop(msg.msg_id, None)
+            return
+        if stolen is not None:
+            self.steals_succeeded += 1
+            task = Task.from_dict(stolen)
+            self.scheduler.add_open(task)
+            self.log(f"[{self.id.short()}] stole task (depth={task.depth}) "
+                     f"from [{victim.node_id.short()}]")
+
+    async def _on_steal_msg(self, msg: Message, addr) -> None:
+        """Handle a STEAL_REQUEST (give work) or STEAL_REPLY (receive work)."""
+        if msg.type == MessageType.STEAL_REQUEST:
+            # A peer is asking us for work: give it one task from our head (FIFO).
+            stolen = self.scheduler.steal()
+            reply_payload = {"task": stolen.to_dict()} if stolen else {}
+            host = msg.payload.get("host", addr[0])
+            port = msg.payload.get("port", addr[1])
+            await self.transport.send_tcp(
+                host, port,
+                Message(
+                    MessageType.STEAL_REPLY, self.id.hex(),
+                    reply_payload, ttl=0,
+                ),
+            )
+        elif msg.type == MessageType.STEAL_REPLY:
+            fut = self._pending_steals.pop(msg.msg_id, None)
+            if fut and not fut.done():
+                task_dict = msg.payload.get("task")
+                fut.set_result(task_dict)
 
     async def _on_gossip(self, msg: Message) -> None:
         """Receiving end of every application link: apply one delivered message
@@ -264,7 +367,12 @@ class Peer:
         owner** (routed by XOR key), so nothing is lost or duplicated — the DHT
         used as a put(task -> owner). ttl=0 means the owner won't re-forward it.
         Otherwise: best-effort gossip (work-stealing tolerates loss/overlap).
+
+        In both modes we stamp ``parent_host`` / ``parent_port`` so the child
+        can later report dead ends directly back to us (hybrid reporting).
         """
+        task.parent_host = self.host
+        task.parent_port = self.port
         payload = {"task": task.to_dict()}
         if self.exclusive and self.owner_roster:
             owner = self._owner_of(task)
@@ -282,96 +390,22 @@ class Peer:
             )
 
     def _pick_task(self) -> Task | None:
-        """Pick the best open task: closest-to-my-ID, optionally owner-filtered."""
+        """Pick the next task to work on: O(1) pop from the deque tail (LIFO).
+
+        In exclusive mode we must only run tasks we own; we scan the deque from
+        the tail and pick the first owned task (still cheap when the pool is
+        small — exclusive mode seeds a bounded frontier).
+        """
         self.scheduler.reclaim_expired()
-        pool = list(self.scheduler.open.values())
-        if self.exclusive:
-            pool = [t for t in pool if self._owns(t)]
-        if not pool:
-            return None
-        return min(pool, key=lambda t: xor_distance(self.id, t.key))
-
-    # ---- work-stealing (dynamic load balancing) -----------------------
-
-    async def _on_work_steal(self, msg: Message, addr) -> None:
-        """Handle a point-to-point work-stealing message.
-
-        * WORK_REQUEST: someone idle is asking me for work. If I have an in-flight
-          task I can re-split, I DONATE a child to them (TCP, direct).
-        * WORK_DONATE: a busy peer answered my request with a task -> adopt it.
-        """
-        if msg.type == MessageType.WORK_REQUEST:
-            donated = self._try_donate()
-            if donated is not None:
-                await self.transport.send_tcp(
-                    addr[0], addr[1],
-                    Message(MessageType.WORK_DONATE, self.id.hex(),
-                            {"task": donated.to_dict()}, ttl=0),
-                )
-        elif msg.type == MessageType.WORK_DONATE:
-            task = Task.from_dict(msg.payload["task"])
-            # Avoid re-adopting a task we already know about / finished.
-            tid = task.id
-            if tid not in self.scheduler.done and tid not in self.scheduler.dead_ends:
-                self.scheduler.add_open(task)
-
-    def _try_donate(self) -> Task | None:
-        """Re-split one in-flight task and return a child to hand out.
-
-        Picks an in-flight task, splits it into children, DONATES one child to
-        the requester, and keeps exactly one child to continue locally. The
-        original (parent) task is retired so the parent + children never overlap
-        (no duplicate exploration). Returns None if nothing is splittable.
-        """
-        if not self._inflight:
-            return None
-        # Prefer the task we've been working on longest (most remaining work).
-        target_tid = min(self._inflight, key=lambda t: self._inflight[t])
-        task = self.scheduler.claimed.get(target_tid) or self.scheduler.open.get(target_tid)
-        if task is None:
-            self._inflight.pop(target_tid, None)
-            return None
-        children = expand_subtasks(self.board, task.path)
-        if len(children) < 2:
-            return None  # can't split further (leaf or contradiction)
-        # Retire the parent: it is now fully covered by its children, so donating
-        # a child does NOT create overlap with our own continued work.
-        self._inflight.pop(target_tid, None)
-        self.scheduler.mark_done(task.path)
-        self._schedule_broadcast(
-            Message(MessageType.TASK_DONE, self.id.hex(), {"path": task.path})
-        )
-        # Keep the first child locally as our new in-flight task; donate another.
-        keep = Task(path=children[0])
-        self.scheduler.add_open(keep)
-        self._inflight[keep.id] = time.monotonic()
-        return Task(path=children[-1])
-
-    def _schedule_broadcast(self, msg: Message) -> None:
-        """Fire-and-forget gossip, safe to call from sync code (no running loop
-        needed: silently dropped if there is no event loop yet)."""
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return  # no running loop (e.g. in unit tests) -> drop gracefully
-        asyncio.create_task(self.gossip.broadcast(msg))
-
-    async def _maybe_steal(self) -> None:
-        """When idle, ask a (likely busy) peer for work."""
-        if not self.work_stealing:
-            return
-        now = time.monotonic()
-        if now - self._last_steal < self.steal_interval:
-            return
-        self._last_steal = now
-        contacts = self.dht.table.all_contacts()
-        if not contacts:
-            return
-        target = random.choice(contacts)
-        await self.transport.send_tcp(
-            target.host, target.port,
-            Message(MessageType.WORK_REQUEST, self.id.hex(), {}, ttl=0),
-        )
+        if not self.exclusive:
+            return self.scheduler.pop_own()
+        # Exclusive: find first owned task from the tail.
+        for task in reversed(self.scheduler.task_deque):
+            if self._owns(task) and self.scheduler._is_pickable(task):
+                self.scheduler.task_deque.remove(task)
+                self.scheduler.task_map.pop(task.id, None)
+                return task
+        return None
 
     # ---- the work loop ------------------------------------------------
 
@@ -383,27 +417,36 @@ class Peer:
         gives a crashed peer's lease time to expire so its task is reclaimed.
         """
         idle_rounds = 0
+        steal_rounds = 0
         self.log(f"[{self.id.short()}] waiting for tasks...")
         while not self._stop.is_set():
             self._maybe_tick()                      # refresh the live dashboard
-            task = self._pick_task()                # closest-to-me, owner-filtered
+            # Periodic bucket refresh (~every 5s): discover newly joined peers
+            # and route around dead ones.  Runs whether idle or busy.
+            self._refresh_round += 1
+            if self._refresh_round % 167 == 0 and self.dht.table.size() > 0:
+                asyncio.create_task(self._refresh_routing())
+            task = self._pick_task()                # O(1) pop from deque tail
             if task is None:
                 idle_rounds += 1
                 if idle_rounds == 1:
                     self.log(f"[{self.id.short()}] idle, waiting for tasks...")
-                # Work-stealing: actively ask a busy peer for work instead of
-                # passively waiting. This is the dynamic-load-balancing path.
-                await self._maybe_steal()
                 # Re-bootstrap every ~1s: submitter may have just started
                 if self._bootstrap_contacts and idle_rounds % 30 == 0:
                     self.log(f"[{self.id.short()}] re-bootstrapping to find submitter...")
                     await self.dht.bootstrap(self._bootstrap_contacts)
+                # Work stealing: every ~0.5s when idle, steal a task from a random
+                # peer's deque head. Gated by --work-stealing (off = push+gossip only).
+                if self.work_stealing and idle_rounds % 15 == 0 and self.dht.table.size() > 0:
+                    steal_rounds += 1
+                    await self._try_steal()
                 if idle_rounds > self.idle_limit:   # quiescent -> we're done
                     self.log(f"[{self.id.short()}] no tasks after {self.idle_limit} polls, exiting")
                     break
                 await asyncio.sleep(0.03)           # wait for tasks to arrive
                 continue
             idle_rounds = 0
+            steal_rounds = 0
             self.log(f"[{self.id.short()}] claiming task (depth={task.depth}, "
                      f"nodes_so_far={self.nodes_expanded})")
             await self._work_on(task)               # claim -> split/solve -> gossip
@@ -433,11 +476,8 @@ class Peer:
         await self.gossip.broadcast(
             Message(MessageType.TASK_CLAIM, self.id.hex(), {"task": task.to_dict()})
         )
-        # Track this task as in-flight so idle peers can steal from us, and so we
-        # renew its lease while we're still working (prevents mistaken reclaim).
-        self._inflight[tid] = time.monotonic()
 
-        # Work-stealing (non-exclusive only): re-split shallow tasks so the grain
+        # Passive splitting (non-exclusive only): re-split shallow tasks so the grain
         # matches the swarm. Exclusive mode distributes statically at submit time
         # instead, which avoids the termination / late-arrival problem.
         if self.split_depth and task.depth < self.split_depth and not self.exclusive:
@@ -446,7 +486,6 @@ class Peer:
                 for child_path in children:
                     await self._route_open_task(Task(path=child_path))
                 # The subtree is now covered by its children -> retire this node.
-                self._inflight.pop(tid, None)
                 self.scheduler.mark_done(task.path)
                 await self.gossip.broadcast(
                     Message(MessageType.TASK_DONE, self.id.hex(), {"path": task.path})
@@ -462,7 +501,6 @@ class Peer:
             node_delay=self.node_delay,
             enumerate_all=self.enumerate_mode,
         )
-        self._inflight.pop(tid, None)  # done -> no longer a steal source
         self.nodes_expanded += result.stats.nodes_expanded
         self.solutions += result.stats.solutions
         if result.board is not None:
@@ -498,14 +536,16 @@ class Peer:
     # ---- pruning / cancel hooks ---------------------------------------
 
     def _tick_and_should_stop(self) -> bool:
-        # Called once per search node: a cheap place to (a) refresh the dashboard
-        # and (b) renew the lease on our in-flight task so a long DFS isn't
-        # mistaken for a dead peer and reclaimed (which would duplicate work).
+        # Called once per search node: cheap place to refresh the dashboard and
+        # renew our lease so the task isn't reclaimed while we're still working.
         self._maybe_tick()
-        for tid in list(self._inflight):
-            task = self.scheduler.claimed.get(tid)
-            if task is not None:
+        # Renew the lease on our current claimed task every ~1s of search work.
+        # This prevents false reclaim during long DFS runs (lease is short for
+        # fast crash detection; renewal keeps live peers from being evicted).
+        for task in self.scheduler.claimed.values():
+            if task.owner == self.id.hex() and task.lease_expires - time.time() < self.lease_seconds * 0.5:
                 self.scheduler.renew(task)
+                break
         return self._stop.is_set()
 
     def _is_dead_end(self, path: Path) -> bool:
@@ -516,13 +556,63 @@ class Peer:
         return False
 
     def _publish_dead_end(self, path: Path) -> None:
-        # Only share shallow, high-value prunings to keep traffic bounded.
+        """Report a dead end.
+
+        Hybrid strategy (see design discussion on parent-child dead-end reporting):
+
+        * If the dead path is a **dispatched child task** (we have a parent
+          address on file for it), report **directly to the parent via TCP**
+          (point-to-point).  The parent marked the task as dispatched and is the
+          only peer that benefits — other peers never explore this exact path,
+          so gossiping it to everyone is pure waste.
+
+        * Otherwise (the peer is solving a task it took from the shared pool and
+          hit a deep dead end that is a prefix of no dispatched child), fall back
+          to gossiping a **shallow** dead end so peers that hold sibling subtasks
+          sharing this prefix can prune early.  Deep dead ends are not worth the
+          bandwidth and are dropped (same policy as before).
+        """
+        tid = path_repr(path)
+        # 1. Mark locally so we don't re-explore.
+        self.scheduler.mark_dead(path)
+        # 2. Try point-to-point report to the parent (if this task has one).
+        claimed = self.scheduler.claimed.get(tid)
+        parent_host = getattr(claimed, "parent_host", None) if claimed else None
+        parent_port = getattr(claimed, "parent_port", None) if claimed else None
+        if parent_host and parent_port:
+            asyncio.create_task(self._report_dead_end_to_parent(path, parent_host, parent_port))
+            return
+        # 3. Fallback: gossip shallow dead ends only.
         if len(path) > self.dead_end_share_depth:
             return
-        self.scheduler.mark_dead(path)
-        # fire-and-forget gossip (we're inside sync DFS)
         asyncio.create_task(
             self.gossip.broadcast(
                 Message(MessageType.DEAD_END, self.id.hex(), {"path": path})
             )
         )
+
+    async def _report_dead_end_to_parent(self, path: Path, host: str, port: int) -> None:
+        """Send a DEAD_END_REPORT straight to the parent peer (point-to-point)."""
+        await self.transport.send_tcp(
+            host, port,
+            Message(
+                MessageType.DEAD_END_REPORT, self.id.hex(),
+                {"path": path, "host": self.host, "port": self.port},
+                ttl=0,
+            ),
+        )
+
+    async def _on_dead_end_report(self, msg: Message, addr) -> None:
+        """Parent receives a dead-end report from a child.
+
+        The child proved ``path`` leads to no solution.  We mark it dead locally
+        so we never dispatch a subtask with that prefix again, and we do NOT
+        re-broadcast (the parent is the only consumer that matters — siblings
+        explore different values at the split cell, so this dead end is
+        irrelevant to them).
+        """
+        path = [tuple(p) for p in msg.payload["path"]]
+        self.scheduler.mark_dead(path)
+        child_id = msg.sender[:8]
+        self.log(f"[{self.id.short()}] dead-end report from [{child_id}] "
+                 f"path={path_repr(path)[:40]}")

@@ -11,10 +11,10 @@ Three *application* message types match the project brief:
 
 Plus the *infrastructure* messages used by discovery / gossip.
 
-Work-stealing notes: WORK_REQUEST / WORK_DONATE travel **directly over TCP**
+Work-stealing notes: STEAL_REQUEST / STEAL_REPLY travel **directly over TCP**
 (routed to a specific peer), NOT through gossip — they are point-to-point
-coordination, not broadcast. This is true work-donation: an idle peer actively
-asks a busy one for work, and the busy one re-splits its in-flight task.
+coordination, not broadcast. An idle peer steals the oldest (coarsest) task from
+a busy peer's deque head (Chase-Lev / Cilk work-stealing).
 """
 
 from __future__ import annotations
@@ -34,9 +34,13 @@ class MessageType(str, Enum):
     # --- task coordination ---
     TASK_CLAIM = "TASK_CLAIM"      # "I'm taking this task" (lease)
     TASK_DONE = "TASK_DONE"        # task fully explored, no solution there
-    # --- work-stealing (dynamic load balancing) ---
-    WORK_REQUEST = "WORK_REQUEST"  # idle peer asks a busy peer for work (TCP)
-    WORK_DONATE = "WORK_DONATE"    # busy peer splits a task and hands part over (TCP)
+    # --- work stealing (load balancing) ---
+    STEAL_REQUEST = "STEAL_REQUEST"  # "Give me a task from your deque"
+    STEAL_REPLY = "STEAL_REPLY"      # "Here's a task" (or empty = none available)
+    # --- hybrid dead-end reporting (child -> parent, point-to-point) ---
+    DEAD_END_REPORT = "DEAD_END_REPORT"  # child tells parent "this path is dead"
+    # --- dynamic membership ---
+    LEAVE_ANNOUNCE = "LEAVE_ANNOUNCE"  # "I'm leaving; drop me from your routing table"
     # --- discovery (Kademlia over UDP) ---
     PING = "PING"
     PONG = "PONG"

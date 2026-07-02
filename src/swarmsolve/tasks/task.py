@@ -34,6 +34,11 @@ class Task:
     status: TaskStatus = TaskStatus.OPEN
     owner: str | None = None          # NodeID hex of current lessee
     lease_expires: float = 0.0        # epoch seconds; 0 = no lease
+    # Parent peer that split & dispatched this task.  When the child proves
+    # this path is a dead end, it reports back directly to the parent via TCP
+    # (point-to-point) instead of gossiping the dead end to the whole network.
+    parent_host: str | None = None
+    parent_port: int | None = None
     depth: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
@@ -60,6 +65,8 @@ class Task:
             "status": self.status.value,
             "owner": self.owner,
             "lease_expires": self.lease_expires,
+            "parent_host": self.parent_host,
+            "parent_port": self.parent_port,
         }
 
     @classmethod
@@ -69,4 +76,6 @@ class Task:
             status=TaskStatus(d.get("status", "OPEN")),
             owner=d.get("owner"),
             lease_expires=d.get("lease_expires", 0.0),
+            parent_host=d.get("parent_host"),
+            parent_port=d.get("parent_port"),
         )
