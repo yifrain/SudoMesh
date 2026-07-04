@@ -268,7 +268,9 @@ parallelism, not threads). Numbers below are produced by `swarmsolve evaluate` o
 instance (`clue_ratio=0.28`, exhaustive search, `node_delay=0.0002` modelling expensive
 per-node work). Re-run with `--repeats 5` and paste medians + the CSVs/plots.
 
-> Test environment (fill in): CPU model, cores, RAM, OS, Python version.
+> **Test environment:** Apple M2 Pro (arm64, 10 cores), 16 GB RAM, macOS 26.0 (Tahoe,
+> build 25A354), CPython 3.11.11. All peers run as separate OS processes over the loopback
+> interface.
 
 ### 6.1 Self-scalability (`evaluate --suite scaling`)
 
