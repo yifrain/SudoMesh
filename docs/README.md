@@ -31,3 +31,9 @@ embeds the measured Evaluation numbers from `swarmsolve evaluate` and Mermaid fi
 Before submission: fill in team names/IDs, export figures to images, re-run the
 evaluation with `--repeats 5`, and convert to a paginated PDF (code in the Appendix,
 not inline in the body).
+
+**Print-ready HTML:** [`report.html`](report.html) renders the same report with an
+academic layout, Mermaid diagrams drawn in-browser, and print CSS (page margins,
+figure/table page-break control). Open it in Chrome/Edge, wait ~1 s for the diagrams,
+then *Print → Save as PDF* (enable “Headers and footers” for page numbers). Yellow
+editor notes are auto-hidden in print; fill in the team table first.
