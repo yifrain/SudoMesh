@@ -1,0 +1,12 @@
+stateDiagram-v2
+    [*] --> OPEN
+    OPEN --> CLAIMED: TASK_CLAIM (lease)
+    CLAIMED --> DONE_SPLIT: expand L levels
+    CLAIMED --> DONE_EXHAUSTED: DFS exhausted
+    CLAIMED --> SOLVED: solution found (first wins)
+    CLAIMED --> OPEN: lease expired (crash)
+    OPEN --> DEAD: DEAD_END prune
+    CLAIMED --> DEAD: DEAD_END prune
+    DONE_SPLIT --> DONE_EXHAUSTED: all children exhausted
+    DONE_EXHAUSTED --> [*]: if root then UNSOLVABLE
+    SOLVED --> [*]

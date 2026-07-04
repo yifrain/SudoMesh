@@ -1,0 +1,11 @@
+sequenceDiagram
+    participant Leaf as Leaf owner
+    participant Mid as Mid task (T1) owner
+    participant Root as Root (T) owner
+    Leaf->>Leaf: DFS exhausted, no solution
+    Leaf->>Mid: EXHAUSTED_REPORT(parent=T1)
+    Mid->>Mid: children_exhausted += 1 (idempotent)
+    Note over Mid: until all children exhausted
+    Mid->>Root: EXHAUSTED_REPORT(parent=T)
+    Root->>Root: all children exhausted and parent is null
+    Root->>Root: verdict UNSOLVABLE

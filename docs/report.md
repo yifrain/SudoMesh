@@ -132,7 +132,8 @@ flowchart TB
         TR["Transport — unicast TCP (tasks) + UDP (discovery) (transport.py)"]
         SO --- TK --- GO --- DI --- TR
     end
-    TR <== "unicast TCP / UDP" ==> NET((Other Peers))
+    NET(("Other Peers"))
+    TR <-->|unicast TCP / UDP| NET
 ```
 *Figure 1 — Five-layer peer architecture (export to image).*
 

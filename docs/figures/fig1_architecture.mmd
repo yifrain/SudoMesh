@@ -1,0 +1,12 @@
+flowchart TB
+    subgraph Peer["A single Peer (one OS process)"]
+        direction TB
+        SO["Solver: constraint propagation + DFS"]
+        TK["Task layer: split / dedup / lease / steal / unsolvable"]
+        GO["Gossip: epidemic spread + TTL + seen-set dedup"]
+        DI["Discovery: Kademlia DHT (XOR keyspace, k-buckets, FIND_NODE)"]
+        TR["Transport: unicast TCP (tasks) + UDP (discovery)"]
+        SO --- TK --- GO --- DI --- TR
+    end
+    NET(("Other Peers"))
+    TR <-->|unicast TCP / UDP| NET
