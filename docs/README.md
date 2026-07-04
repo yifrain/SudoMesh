@@ -37,3 +37,11 @@ academic layout, Mermaid diagrams drawn in-browser, and print CSS (page margins,
 figure/table page-break control). Open it in Chrome/Edge, wait ~1 s for the diagrams,
 then *Print → Save as PDF* (enable “Headers and footers” for page numbers). Yellow
 editor notes are auto-hidden in print; fill in the team table first.
+
+**LaTeX (recommended for the final submission PDF):** [`report.tex`](report.tex) — a standard
+`article` with automatic section/figure numbering, a proper (unnumbered) Abstract, and
+professional page-breaking (best for the "some pages too full / too empty" issue). Upload it to
+Overleaf (or run `pdflatex` twice). Export the three Mermaid diagrams from `report.html` (or
+mermaid.live) into a `figures/` folder as `fig1_architecture.png`, `fig2_statemachine.png`,
+`fig3_aggregation.png`; the document still compiles with labelled placeholder boxes if a figure
+is missing. Only the team names/IDs remain to be filled in.

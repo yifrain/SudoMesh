@@ -1,0 +1,457 @@
+% =====================================================================
+% SwarmSolve — Project Report
+% Compile: pdfLaTeX (or upload to Overleaf). Run twice for the ToC/refs.
+%
+% Figures: export the 3 Mermaid diagrams (from docs/report.html or the
+% mermaid.live editor) as PNG/PDF into a  figures/  folder next to this
+% file, named:
+%     figures/fig1_architecture.png
+%     figures/fig2_statemachine.png
+%     figures/fig3_aggregation.png
+% If a figure file is missing the document still compiles and shows a
+% labelled placeholder box (see \figorbox).
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{textcomp}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{figures/}}
+\captionsetup{font=small,labelfont=bf}
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{0pt}
+\newcommand{\code}[1]{\texttt{#1}}
+
+% Show the figure if it exists, otherwise a labelled placeholder box.
+\newcommand{\figorbox}[2]{%
+  \IfFileExists{figures/#1}%
+    {\includegraphics[width=\linewidth]{#1}}%
+    {\fbox{\parbox[c][3.5cm][c]{\dimexpr\linewidth-2\fboxsep-2\fboxrule}{%
+        \centering\ttfamily #1\\[2pt]\small (export this Mermaid diagram to figures/#1)\\[2pt]\itshape #2}}}%
+}
+
+% ---------------------------------------------------------------------
+\begin{document}
+
+% ============================ TITLE PAGE =============================
+\begin{titlepage}
+  \centering
+  \vspace*{2cm}
+  {\large P2P Systems and Security \textperiodcentered\ Resilient Systems (INF-25-Ma-FSA-Res)\par}
+  {\large TU Dresden\par}
+  \vspace{2.5cm}
+  {\Huge\bfseries SwarmSolve\par}
+  \vspace{0.5cm}
+  {\large\itshape A Decentralized P2P System for Large-Scale Constraint Search\par}
+  \vspace{2.5cm}
+  {\large
+   \textbf{Semester:} 2026 Summer\\[4pt]
+   \textbf{Instructor:} Prof.\ Tschorsch\\[4pt]
+   \textbf{Submission date:} 2026-07-14\par}
+  \vspace{2cm}
+
+  \renewcommand{\arraystretch}{1.3}
+  \begin{tabular}{c l l l}
+    \toprule
+    \textbf{Role} & \textbf{Name} & \textbf{Student ID} & \textbf{Primary module}\\
+    \midrule
+    A & \textit{[name]} & \textit{[id]} & Transport (\code{transport/})\\
+    B & \textit{[name]} & \textit{[id]} & Discovery / Kademlia (\code{discovery/})\\
+    C & \textit{[name]} & \textit{[id]} & Gossip + Task split\\
+    D & \textit{[name]} & \textit{[id]} & Solver engine (\code{solver/})\\
+    E & \textit{[name]} & \textit{[id]} & Fault tolerance + orchestration + demos\\
+    \bottomrule
+  \end{tabular}
+
+  \vfill
+  {\small Companion code-level docs: \code{docs/optimizations.en.md}, \code{docs/architecture.en.md}.\par}
+\end{titlepage}
+
+% ============================== ABSTRACT ============================
+\begin{abstract}
+SwarmSolve is a fully decentralized peer-to-peer (P2P) system that solves very large
+constraint-search problems --- concretely, large Sudoku instances (9$\times$9 up to
+25$\times$25) --- by distributing the search tree across many equal peers with \textbf{no
+central server, directory, or coordinator}. Peers self-organize with a self-implemented
+\textbf{Kademlia} overlay built directly on TCP/UDP sockets, and we reuse the Kademlia XOR
+key-space as the \emph{task-ID} space so the DHT doubles as a load balancer. Work is spread by
+epidemic \textbf{gossip} and balanced at run time by \textbf{fine-grained work stealing} (a
+stealable per-peer deque guided by search-space estimation). Fault tolerance is provided by
+\textbf{time-boxed leases} with automatic reclamation and by \textbf{periodic frontier
+snapshots} to backup peers, so a crashed peer's work is recovered from a checkpoint rather
+than redone. Beyond finding a solution, the system can \textbf{prove a puzzle unsolvable} by
+aggregating exhaustion reports bottom-up to a replicated root task. On a 9$\times$9 exhaustive
+workload we measure \textbf{3.78$\times$ speedup on 4 peers at 94\,\% parallel efficiency with
+exact (duplicate-free) result counts}, \textbf{100\,\% completion with only $\sim$0.83\,s
+recovery overhead} when a peer is killed mid-run, and \textbf{$\sim$34\,\% of the work absorbed
+by peers that join after tasks were seeded}, demonstrating self-scalability, resilience, and
+churn-tolerance respectively.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================ INTRODUCTION ==========================
+\section{Introduction}
+
+\textbf{Background \& motivation.} Peer-to-peer systems remove the single point of failure and
+scaling bottleneck of the client--server model by making every node an equal participant. This
+decentralization underpins resilient and Web3-style systems: content distribution (BitTorrent),
+storage (IPFS), and volunteer computing (BOINC). SwarmSolve applies the same philosophy to
+\emph{distributed compute sharing}: a large combinatorial search is a huge tree of partial
+states; instead of one machine exploring it, many peers explore disjoint subtrees in parallel
+and share pruning information.
+
+\textbf{Limitation of existing approaches.} Volunteer-computing platforms such as BOINC are
+\emph{centrally coordinated} --- a master server hands out work units and collects results.
+Pure P2P systems (BitTorrent, IPFS) distribute \emph{data} but not a \emph{cooperative
+computation with a global termination condition} (e.g.\ ``the answer was found'' or ``no answer
+exists''). We are not aware of a decentralized system that both balances a search workload and
+can collectively \emph{decide unsatisfiability}.
+
+\textbf{Project objective.} Build a server-less P2P system in which (O1) any number of peers can
+join and receive a fair share of work (self-scalability); (O2) the swarm keeps working
+correctly when arbitrary peers crash (resilience); (O3) the first solution stops everyone; and
+--- our novel goal --- (O4) the swarm can \emph{prove} a problem has no solution. Success
+criteria are quantified in Section~\ref{sec:eval}.
+
+\textbf{Scope \& simplifying assumptions.} Per the course brief we explicitly \textbf{do not}
+implement bootstrapping (a joining peer is given one known contact address) or NAT traversal;
+we use \textbf{only unicast TCP/UDP} (no multicast/broadcast). These boundaries are discussed
+in Section~\ref{sec:discussion}.
+
+\textbf{Report overview.} Section~\ref{sec:sota} compares classical P2P protocols and states our
+novelty; Section~\ref{sec:design} gives the design and self-defined protocol;
+Section~\ref{sec:impl} covers the implementation; Section~\ref{sec:eval} evaluates scalability,
+resilience and churn; Section~\ref{sec:discussion} discusses limitations; Section~\ref{sec:conc}
+concludes.
+
+% ============================ STATE OF THE ART ======================
+\section{State of the Art}\label{sec:sota}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Comparison of classical P2P protocols.}
+  \small
+  \begin{tabular}{@{}l l l p{3.4cm} p{3.6cm}@{}}
+    \toprule
+    \textbf{Protocol} & \textbf{Structure} & \textbf{Lookup} & \textbf{Strengths} & \textbf{Weaknesses (for us)}\\
+    \midrule
+    Gnutella & Unstructured & Flooding & Simple, churn-robust & No key$\to$node mapping; flooding does not scale\\
+    Chord & Ring & $O(\log N)$ & Elegant successor ring & Asymmetric metric; static partition\\
+    CAN & $d$-torus & $O(dN^{1/d})$ & Geometric locality & Higher maintenance\\
+    \textbf{Kademlia} & XOR tree & $O(\log N)$ & Symmetric XOR metric; long-lived-peer preference; UDP-light & STORE/FIND\_VALUE unneeded here\\
+    BitTorrent & Hybrid & --- & Proven data distribution & Distributes data, not computation\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Why Kademlia.} Its XOR metric is symmetric and unidirectional, so a \emph{single}
+key-space can serve both routing \emph{and} task placement: the peer(s) whose ID is XOR-closest
+to a task's key are its natural owners. This ties discovery directly to load balancing.
+
+\textbf{Novelty of SwarmSolve.}
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{DHT-as-load-balancer:} the Kademlia XOR key-space is reused as the task-ID space.
+  \item \textbf{Coarse gossip + fine-grained work stealing:} a Chord-style stealable deque is
+        fused onto the Kademlia backbone, avoiding Chord's ``steal only from neighbours'' bias by
+        stealing over an unstructured random-ID pull channel, guided by search-space estimation.
+  \item \textbf{Decentralized unsatisfiability proof:} bottom-up exhaustion aggregation over a
+        task tree with a \emph{replicated root}, so the ``no-solution'' verdict survives crashes.
+\end{enumerate}
+
+% ============================ DESIGN ================================
+\section{System Design}\label{sec:design}
+
+\subsection{Layered architecture}
+\begin{figure}[htbp]
+  \centering
+  \figorbox{fig1_architecture.png}{Five-layer peer architecture (Solver / Task / Gossip / Discovery / Transport).}
+  \caption{Five-layer peer architecture.}
+  \label{fig:arch}
+\end{figure}
+
+\subsection{Overlay choice}
+Structured (Kademlia) over unstructured, because the XOR key-space gives deterministic,
+low-collision task placement and doubles as a load balancer. The mechanism is deliberately
+\emph{decoupled} from the overlay: gossip fan-out and work stealing operate on whatever contacts
+the routing table provides, so the design would also run on an unstructured overlay.
+
+\subsection{Self-defined application protocol}
+\textbf{Node / Task IDs.} 160-bit IDs. A node ID is SHA-1 of \code{host:port}; a task ID is the
+canonical string of its assignment path (e.g.\ \code{12=4;37=9}) and its key is SHA-1 of
+\code{task:}+id, placing it in the \emph{same} space as node IDs.
+
+\textbf{Wire format.} Newline-delimited JSON; every message carries
+\code{type, sender, payload, msg\_id, ttl, ts}. Full schemas in Appendix~\ref{app:msg}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Self-defined message types.}
+  \small
+  \begin{tabular}{@{}l l@{}}
+    \toprule
+    \textbf{Category} & \textbf{Messages}\\
+    \midrule
+    Discovery (UDP) & \code{PING}, \code{PONG}, \code{FIND\_NODE}, \code{FIND\_NODE\_REPLY}\\
+    Application (TCP) & \code{OPEN\_TASK}, \code{DEAD\_END}, \code{SOLUTION}\\
+    Task coordination & \code{TASK\_CLAIM}, \code{TASK\_DONE}\\
+    Task pull (cold start / stealing) & \code{TASK\_QUERY}, \code{TASK\_OFFER}\\
+    Unsatisfiability aggregation & \code{SPLIT\_REPORT}, \code{EXHAUSTED\_REPORT}\\
+    Crash recovery & \code{STATE\_SYNC}\\
+    Gossip envelope & \code{GOSSIP\_PUSH}\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Routing logic.} Iterative \code{FIND\_NODE}: query the $\alpha$ closest un-queried
+contacts per round; each round roughly halves the XOR distance, giving $O(\log N)$ hops.
+\code{closest\_to\_key} and \code{is\_responsible\_for} derive task ownership from the routing
+table.
+
+\begin{figure}[htbp]
+  \centering
+  \figorbox{fig2_statemachine.png}{Task state machine: OPEN, CLAIMED, DONE\_SPLIT, DONE\_EXHAUSTED, SOLVED, DEAD.}
+  \caption{Task state machine.}
+  \label{fig:sm}
+\end{figure}
+
+\subsection{Communication model (TCP vs UDP)}
+UDP for discovery RPCs (small, best-effort, churn-tolerant); TCP for task payloads that must be
+reliable. All sends are \textbf{unicast} to a specific \code{host:port}; ``gossip broadcast'' is
+application-level fan-out to a random subset of \emph{individual} contacts --- there is
+\textbf{no} network multicast/broadcast. Concurrency is single-threaded \code{asyncio};
+CPU-bound DFS periodically yields so inbound messages are served while computing.
+
+\subsection{Fault tolerance}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Failure detection via leases:} a claim carries a lease; if the holder dies the
+        lease lapses and the task returns to the open pool for another peer.
+  \item \textbf{Replication:} the root task is held by the $k$ XOR-closest peers so the verdict
+        is not lost with one node.
+  \item \textbf{Checkpoint recovery:} busy peers periodically \code{STATE\_SYNC} their unexplored
+        frontier to backups; on reclaim a survivor resumes from the snapshot.
+  \item \textbf{Overlay churn tolerance:} k-buckets prefer long-lived contacts; lookups route
+        around dead peers.
+\end{itemize}
+
+\subsection{Bottom-up unsatisfiability aggregation}
+\begin{figure}[htbp]
+  \centering
+  \figorbox{fig3_aggregation.png}{Leaf $\to$ mid $\to$ replicated root EXHAUSTED\_REPORT aggregation.}
+  \caption{Bottom-up exhaustion aggregation to the replicated root.}
+  \label{fig:agg}
+\end{figure}
+
+\subsection{Module decomposition}
+\code{transport/} (I/O), \code{discovery/} (Kademlia), \code{gossip/} (epidemic spread),
+\code{tasks/} (split/dedup/lease/steal/aggregate), \code{solver/} (search), \code{peer.py}
+(orchestration), \code{cli.py} (demos + evaluation).
+
+% ============================ IMPLEMENTATION ========================
+\section{Implementation}\label{sec:impl}
+
+\textbf{Language \& tools.} Python 3.11+, \code{asyncio} for concurrency, standard-library
+sockets via \code{asyncio} streams/datagrams (no third-party P2P framework); \code{typer}+\code{rich}
+for the CLI; \code{pytest} for tests; \code{uv} for packaging.
+
+\textbf{Self-implemented vs libraries.} The overlay (XOR metric, k-buckets, iterative
+\code{FIND\_NODE}), gossip, leasing, work stealing and the wire protocol are all hand-written on
+top of raw asyncio TCP/UDP. No P2P library is used; only Python's standard networking primitives.
+
+\textbf{Node lifecycle.} (1)~\emph{Join:} start transport, bootstrap from one known contact,
+populate buckets via self-lookup. (2)~\emph{Acquire work:} pick the XOR-closest local open task;
+if none, probe a random ID and steal via \code{TASK\_QUERY}/\code{TASK\_OFFER}. (3)~\emph{Process:}
+claim (lease), then either split one level (publish children + \code{SPLIT\_REPORT}) or DFS a
+leaf; emit \code{DEAD\_END} on pruning, \code{SOLUTION} on success, \code{EXHAUSTED\_REPORT} on a
+dead subtree. (4)~\emph{Leave/crash:} lease expires; a survivor reclaims, optionally resuming from
+a \code{STATE\_SYNC} checkpoint.
+
+\textbf{Meeting the three mandatory requirements.} \emph{No central authority:} ownership is
+computed from the routing table; no server/directory exists. \emph{Fault tolerance:} leases +
+reclamation + checkpointing + root replication. \emph{Self-scalability:} XOR placement spreads
+work; late joiners pull/steal work (Section~\ref{sec:eval}).
+
+\textbf{Key challenges \& solutions.} (a)~\emph{Blocking DFS starves the event loop} ---
+cooperative yields turn DFS into a stealable, interruptible loop. (b)~\emph{Duplicate exploration
+inflates counts} --- an exclusive single-owner mode (XOR-closest + virtual nodes) gives exact
+counts, while work-stealing mode tolerates duplication for availability. (c)~\emph{Idempotent
+aggregation} --- \code{EXHAUSTED\_REPORT} deduplicates children by ID so gossip retransmission
+cannot over-count.
+
+% ============================ EVALUATION ============================
+\section{Evaluation}\label{sec:eval}
+
+\textbf{Method.} All peers are separate OS processes over real localhost sockets (genuine
+parallelism, not threads). Numbers below are produced by \code{swarmsolve evaluate} on a
+9$\times$9 instance (clue ratio 0.28, exhaustive search, per-node delay 0.0002\,s modelling
+expensive work).
+
+\textbf{Test environment.} Apple M2 Pro (arm64, 10 cores), 16\,GB RAM, macOS 26.0 (Tahoe, build
+25A354), CPython 3.11.11. All peers run as separate OS processes over the loopback interface.
+
+\subsection{Self-scalability}
+Exhaustive search (count all solutions), exclusive single-owner mode (no duplicate work).
+
+\begin{table}[htbp]
+  \centering
+  \caption{Self-scalability: speedup, efficiency and throughput vs.\ number of peers.}
+  \small
+  \begin{tabular}{@{}l r r r r r r@{}}
+    \toprule
+    \textbf{peers} & \textbf{wall (s)} & \textbf{sp.\ vs base} & \textbf{sp.\ vs 1} & \textbf{eff.} & \textbf{nodes/s} & \textbf{solutions}\\
+    \midrule
+    baseline (1 machine) & 37.6 & 1.00$\times$ & --- & --- & --- & 45\,475\\
+    1 & 46.7 & 0.81$\times$ & 1.00$\times$ & 100\,\% & 2\,090 & 45\,475\\
+    2 & 25.4 & 1.48$\times$ & 1.84$\times$ & 92\,\% & 3\,838 & 45\,475\\
+    4 & 12.3 & 3.04$\times$ & \textbf{3.78$\times$} & \textbf{94\,\%} & 7\,880 & 45\,475\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Solution counts are identical to the single-machine baseline, i.e.\ the distribution is
+\textbf{exact and duplicate-free}. Speedup is near-linear: 3.78$\times$ on 4 peers relative to a
+single peer (94\,\% efficiency). The 1-peer run is slower than the baseline because of the fixed
+distribution overhead (process startup + settle), amortized as peers increase.
+
+\subsection{Resilience}
+Exhaustive mode so \emph{every} task must complete; we kill one peer mid-run. ``Completion''
+means the run still found \emph{all} solutions ($\ge$ the exact count), i.e.\ the dead peer's task
+was reclaimed and re-explored.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Resilience: completion and recovery overhead under a random crash.}
+  \small
+  \begin{tabular}{@{}l r r r@{}}
+    \toprule
+    \textbf{scenario} & \textbf{completion \%} & \textbf{median wall (s)} & \textbf{recovery overhead (s)}\\
+    \midrule
+    no-fault & 100\,\% & 21.7 & 0.00\\
+    kill 1 peer @ $\sim$8.7\,s & \textbf{100\,\%} & 22.5 & \textbf{+0.83}\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The swarm loses nothing when a peer dies: the lease of its in-flight task expires and a survivor
+re-explores it, adding sub-second overhead.
+
+\subsection{Churn / dynamic join}
+Half the peers join \textbf{1.5\,s after} tasks were seeded; work stealing enabled.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Churn: work share of early vs.\ late-joining peers.}
+  \small
+  \begin{tabular}{@{}c l r r@{}}
+    \toprule
+    \textbf{peer} & \textbf{join} & \textbf{nodes} & \textbf{tasks\_done}\\
+    \midrule
+    0 & early & 57\,022 & 4\\
+    1 & early & 33\,615 & 3\\
+    2 & late  & 6\,961  & 1\\
+    3 & late  & 40\,574 & 2\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Late joiners performed $\sim$34\,\% of the total work: the swarm absorbs nodes that appear after
+seeding --- self-scalability under churn.
+
+\subsection{Comparison}
+\emph{vs client--server:} there is no coordinator; the ``master'' role (the root task) is
+replicated across $k$ peers, so there is no single point of failure --- unlike BOINC-style
+central dispatch. \emph{vs the parallel lower bound:} ideal speedup on $P$ peers is $P\times$; we
+reach 3.78$\times$ on 4 peers (94\,\% of the $4\times$ bound) with exact counts, the loss being
+coordination and settle overhead.
+
+% ============================ DISCUSSION ============================
+\section{Discussion}\label{sec:discussion}
+
+\textbf{Strengths.} Genuinely decentralized (ownership from the routing table); resilient (leases
++ replication + checkpointing, 100\,\% completion under a crash); self-scalable (near-linear
+speedup, late joiners absorbed); and --- uniquely --- able to prove unsatisfiability in a
+distributed, crash-tolerant way.
+
+\textbf{Limitations \& simplifications.} (1)~Bootstrapping and NAT traversal are out of scope; a
+joiner needs one known contact and a routable address. (2)~First-solution search barely
+parallelizes on tiny inputs (coordination dominates); the parallel win is in exhaustive search,
+which we report honestly. (3)~The unsolvable-instance generator produces \emph{shallow} boards
+(propagation finds the contradiction quickly), so the unsatisfiability demo proves \emph{mechanism
+correctness}, not search scale. (4)~Work-stealing mode may explore some subtrees redundantly --- a
+consistency-vs-availability trade-off; exclusive mode removes duplication but needs reliable
+delivery. (5)~Experiments are localhost multi-process; cross-host runs use the same unicast
+protocol but were not benchmarked at scale.
+
+\textbf{Future work.} Churn-aware ownership without a static roster; adaptive work donation using
+the search-space estimator to pick split points; deep unsatisfiable instances; and a jigsaw or
+other solver by swapping only the \code{solver/} package.
+
+% ============================ CONCLUSION ============================
+\section{Conclusion}\label{sec:conc}
+
+SwarmSolve demonstrates a server-less P2P system that meets the three mandatory requirements ---
+no central authority, fault tolerance, self-scalability --- on a self-implemented Kademlia overlay
+with a self-defined application protocol over unicast TCP/UDP. It adds a novel decentralized
+unsatisfiability proof and fine-grained work stealing, and we quantify near-linear speedup
+(3.78$\times$ / 94\,\% on 4 peers), crash resilience (100\,\% completion, $\sim$0.83\,s overhead)
+and churn absorption ($\sim$34\,\% of the work by late joiners). The main learning outcome is how
+reusing one XOR key-space for both routing and task placement turns a DHT into a load balancer,
+and how leases + checkpointing + replication combine into practical resilience.
+
+% ============================ REFERENCES ============================
+\begin{thebibliography}{9}
+  \bibitem{kademlia} P.~Maymounkov and D.~Mazi\`eres. \emph{Kademlia: A Peer-to-peer Information
+    System Based on the XOR Metric.} IPTPS, 2002.
+  \bibitem{chord} I.~Stoica et al. \emph{Chord: A Scalable Peer-to-peer Lookup Service for
+    Internet Applications.} ACM SIGCOMM, 2001.
+  \bibitem{can} S.~Ratnasamy et al. \emph{A Scalable Content-Addressable Network (CAN).} ACM
+    SIGCOMM, 2001.
+  \bibitem{bittorrent} B.~Cohen. \emph{Incentives Build Robustness in BitTorrent.} Workshop on
+    Economics of P2P Systems, 2003.
+  \bibitem{bubblestorm} W.~W.~Terpstra et al. \emph{BubbleStorm: Resilient, Probabilistic, and
+    Exhaustive Peer-to-Peer Search.} ACM SIGCOMM, 2007.
+  \bibitem{boinc} D.~P.~Anderson. \emph{BOINC: A System for Public-Resource Computing and
+    Storage.} IEEE/ACM Workshop on Grid Computing, 2004.
+  \bibitem{course} Course lecture notes, P2P Systems / Resilient Systems, TU Dresden, 2026.
+\end{thebibliography}
+
+% ============================ APPENDIX ==============================
+\appendix
+\section{Message formats}\label{app:msg}
+\code{OPEN\_TASK} / \code{TASK\_CLAIM} payload: a task with \code{path, status, owner,
+lease\_expires, children, children\_exhausted, parent\_id}. \code{DEAD\_END} / \code{TASK\_DONE}:
+a \code{path} list of \code{[cell,val]} pairs. \code{SOLUTION}: a \code{board} flat-int list, or
+\code{unsolvable:true}. \code{TASK\_QUERY}: \code{host, port}; \code{TASK\_OFFER}: a task.
+\code{SPLIT\_REPORT}: a task; \code{EXHAUSTED\_REPORT}: \code{parent\_id, child\_id}.
+\code{STATE\_SYNC}: \code{task\_id, frontier (list of paths), nodes}. \code{FIND\_NODE}:
+\code{target}; \code{FIND\_NODE\_REPLY}: \code{target, nodes(id/host/port), reply\_to}.
+
+\section{Key algorithms (source locations)}
+Iterative lookup, the work-stealing deque loop, and bottom-up aggregation are implemented in
+\code{discovery/kademlia.py} (\code{lookup}), \code{peer.py} (\code{\_work\_on\_stealing},
+\code{\_steal\_from\_deque}) and \code{peer.py} (\code{\_on\_exhausted\_report}).
+
+\section{Reproducing the evaluation}
+\begin{verbatim}
+uv sync --extra dev
+uv run pytest -q                                   # 24 passed
+uv run swarmsolve evaluate --suite all --peers-list 1,2,4 --peers 4 \
+    --repeats 5 --csv-dir eval_out                 # scaling/resilience/churn + CSV
+\end{verbatim}
+
+\section{Team contribution}
+Each member owns the module listed on the title page. Add a short per-member paragraph describing
+concrete contributions to justify that the workload is proportional to team size.
+
+\end{document}
