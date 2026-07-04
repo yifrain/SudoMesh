@@ -13,7 +13,7 @@ Legend for each step:
 
 ```bash
 uv sync --extra dev                 # install deps into .venv
-uv run pytest -q                    # sanity: 8 passed
+uv run pytest -q                    # sanity: 24 passed
 # pre-generate the wide puzzle used in the speedup part:
 uv run swarmsolve gen --size 9 --clue-ratio 0.28 --seed 7 --out wide.txt
 ```
@@ -33,6 +33,7 @@ uv run swarmsolve gen --size 9 --clue-ratio 0.28 --seed 7 --out wide.txt
 | 3 | Fault tolerance | E | 2 min |
 | 4 | Live dashboard | C | 1 min |
 | 5 | Honest speedup + scaling | B | 2.5 min |
+| 5b | Bonus: work stealing + unsolvable (optional) | B/E | 1.5 min |
 | 6 | Design trade-offs | A | 1.5 min |
 | 7 | Q&A | all | rest |
 
@@ -174,6 +175,50 @@ for p in 1 2 4; do uv run swarmsolve benchmark --file wide.txt --peers $p --node
 efficiency** — with **exact counts and ~0 % duplicate work**. Virtual nodes
 (consistent hashing, Ch.5) are what made the load even — without them one peer
 was doing 47 % of the work."
+
+---
+
+## Part 5b — Bonus: work stealing & unsolvable detection  *(optional)*
+
+Two recent optimizations, each a one-command demo. Full design:
+[`docs/optimizations.en.md`](optimizations.en.md).
+
+### Fine-grained work stealing (`--steal`)
+
+**[Say]** "First-solution on 9×9 barely parallelized in Part 2. With fine-grained
+**work stealing**, each busy peer exposes a *stealable deque* of unexplored
+branches; idle peers steal the heaviest branch (search-space estimation) over the
+existing pull channel — with no duplicated work."
+
+**[Run]**
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4 \
+    --node-delay 0.002 --steal
+```
+**[Expect]** wall-clock speedup jumps from ~1.0x (Part 2) to ~4x, with *fewer*
+total nodes explored.
+
+**[Highlight]** "This is Chord-style deque work-stealing fused onto the Kademlia
+backbone: coarse-grained gossip scatters the initial tasks, fine-grained stealing
+rebalances dynamically. Add `--sync-interval 0.3` to also snapshot each peer's
+frontier to backups for crash recovery."
+
+### Unsolvable detection
+
+**[Say]** "The swarm can also **prove a puzzle has no solution**. `DONE` is split
+into `DONE_SPLIT`/`DONE_EXHAUSTED`; exhausted branches report up the task tree,
+and when the (replicated) root task is exhausted the swarm declares UNSOLVABLE."
+
+**[Run]**
+```bash
+uv run swarmsolve unsolvable --peers 4 --split-depth 3
+```
+**[Expect]** every peer prints `UNSOLVABLE` and the summary confirms `verdict
+matches single-machine baseline`.
+
+**[Highlight]** "Bottom-up `DONE_EXHAUSTED` aggregation + a replicated root task
+remove the single point of failure — the no-solution verdict survives node
+crashes."
 
 ---
 

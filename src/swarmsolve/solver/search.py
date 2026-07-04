@@ -50,6 +50,34 @@ def apply_path(initial: Board, path: Path) -> Board:
     return board
 
 
+def estimate_board_size(board: Board) -> float:
+    """Estimate the *log-size* of the search tree still below ``board``.
+
+    A cheap, comparable heuristic: the sum over unsolved cells of
+    ``log2(#candidates)``. This is the log of the naive product of branching
+    factors, so bigger = a heavier subtree. Used to prioritize work stealing
+    (thieves should grab the *largest* remaining subtree) and to guide where to
+    split. Returns 0.0 for a complete/near-complete board.
+    """
+    from math import log2
+
+    total = 0.0
+    for mask in board.cells:
+        c = bin(mask).count("1")
+        if c > 1:
+            total += log2(c)
+    return total
+
+
+def estimate_subtree_size(initial: Board, path: Path) -> float:
+    """Estimate the log-size of the subtree rooted at ``path`` (0.0 if dead)."""
+    try:
+        board = apply_path(initial, path)
+    except Contradiction:
+        return 0.0
+    return estimate_board_size(board)
+
+
 def expand_subtasks(initial: Board, path: Path) -> list[Path]:
     """Split the subtree rooted at ``path`` into child subtasks.
 

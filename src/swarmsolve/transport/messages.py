@@ -29,6 +29,14 @@ class MessageType(str, Enum):
     # --- task coordination ---
     TASK_CLAIM = "TASK_CLAIM"      # "I'm taking this task" (lease)
     TASK_DONE = "TASK_DONE"        # task fully explored, no solution there
+    # --- task pull (random-id probing / cold start) ---
+    TASK_QUERY = "TASK_QUERY"      # "do you have an open task for me?"
+    TASK_OFFER = "TASK_OFFER"      # "here is an open task you may claim"
+    # --- unsolvable aggregation (bottom-up) ---
+    SPLIT_REPORT = "SPLIT_REPORT"          # child->parent: "I expanded into children"
+    EXHAUSTED_REPORT = "EXHAUSTED_REPORT"  # child->parent: "my branch is exhausted"
+    # --- periodic state sync (crash recovery for work stealing) ---
+    STATE_SYNC = "STATE_SYNC"      # owner->backups: snapshot of my unexplored frontier
     # --- discovery (Kademlia over UDP) ---
     PING = "PING"
     PONG = "PONG"

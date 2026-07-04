@@ -183,6 +183,8 @@ talking over real localhost sockets, so the CPU-bound search runs in parallel.
 | 5 | `fault` | Kill a peer mid-solve → task auto-reassigned | **Fault tolerance & lease mechanism** |
 | 6 | `dashboard` | Live per-peer task counters | Real-time load distribution |
 | 7 | `peer` | Manual multi-terminal demo | Interactive live demo |
+| 8 | `unsolvable` | Prove a puzzle has NO solution (bottom-up aggregation) | **Hierarchical unsolvable detection** |
+| 9 | `evaluate` | Quantitative experiments (scalability / resilience / churn) → CSV | **Report Evaluation data** |
 
 #### 1. `solve` — single-machine baseline
 
@@ -220,6 +222,18 @@ Shows:
 
 **Note:** First-solution search has limited parallelism (the answer sits on one
 deep path). See `benchmark` below for honest speedup.
+
+**Fine-grained work stealing (`--steal`):** add `--steal` to turn each busy peer
+into a stealable work deque — idle peers steal unexplored branches from busy
+peers instead of only relying on gossip re-split. Measured on `hard_9x9` with
+4 peers: **~1.03× → ~4.04× wall-clock speedup** (near-linear), with *less*
+duplicate work. See [`docs/optimizations.en.md`](docs/optimizations.en.md)
+([简体中文](docs/optimizations.zh-CN.md)) for the design.
+
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4 \
+    --node-delay 0.002 --steal
+```
 
 #### 4. `benchmark` — exhaustive search with real speedup
 
@@ -292,6 +306,42 @@ uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
   nodes explored climbing → `received SOLUTION via gossip` or `FOUND solution`
 - **SOLUTION propagates**: the first peer to find the solution gossips it to ALL
   known peers, so everyone stops together
+
+#### 8. `unsolvable` — prove a puzzle has NO solution
+
+```bash
+uv run swarmsolve unsolvable --peers 4 --split-depth 3
+```
+
+Peers split the search tree, exhaust leaf branches, and report `DONE_EXHAUSTED`
+up to their parents; when the (replicated) root task becomes exhausted, the
+swarm declares the puzzle **unsolvable** and cross-checks the single-machine
+baseline. This exercises three optimizations — random-id probing, bottom-up
+unsolvable aggregation, and a replicated root task — described in detail in
+[`docs/optimizations.en.md`](docs/optimizations.en.md)
+([简体中文](docs/optimizations.zh-CN.md)).
+
+#### 9. `evaluate` — quantitative experiments for the report
+
+Produces the numbers/figures the project report's **Evaluation** chapter needs.
+By default it generates a *wide* puzzle (large exhaustive search tree) so the
+parallel effect is real, and can dump CSVs for plotting.
+
+```bash
+uv run swarmsolve evaluate --suite all --peers-list 1,2,4 --peers 4 \
+    --repeats 3 --csv-dir eval_out
+```
+
+Three experiments (measured on 9×9, `clue_ratio=0.28`, `node_delay=0.0002`):
+
+| Experiment | What it measures | Sample result |
+|------------|------------------|---------------|
+| `scaling` | self-scalability: speedup / efficiency / throughput vs #peers | 4 peers → **3.78× vs 1 peer, 94 % efficiency**, exact solution counts |
+| `resilience` | crash recovery: completion % + recovery overhead | kill 1 peer → **100 % completion, +0.83 s overhead** |
+| `churn` | dynamic join: do late joiners pick up work? | late joiners did **~34 % of the work** |
+
+Run a single experiment with `--suite scaling|resilience|churn`. Bigger workload
+= cleaner curves: lower `--clue-ratio` (wider tree) or raise `--node-delay`.
 
 See the **code-level docs** in [`docs/`](docs/README.md) for detailed output
 examples and the metrics table.
@@ -499,6 +549,8 @@ pytest -q
 | 5 | `fault` | 求解中途杀掉节点，自动重分配 | **容错 + 租约机制** |
 | 6 | `dashboard` | 各节点任务计数的实时仪表盘 | 实时负载分布 |
 | 7 | `peer` | 多终端手动演示 | 交互式现场演示 |
+| 8 | `unsolvable` | 证明题目无解（自底向上聚合） | **层级化无解判定** |
+| 9 | `evaluate` | 量化实验（自扩展性 / 弹性 / 动态加入）→ CSV | **报告 Evaluation 数据** |
 
 #### 1. `solve` — 单机基线
 
@@ -537,6 +589,13 @@ uv run swarmsolve demo --file examples/puzzles/puzzle16.txt --peers 4
 3. Wall-clock 对比
 
 **注意**：首解搜索并行度有限（解只位于一条深路径上），请用下面的 `benchmark` 观察真实加速。
+
+**细粒度 work stealing（`--steal`）**：加上 `--steal`，每个繁忙节点把子树放进一个**可被偷取的工作 deque**——空闲节点直接从繁忙节点偷走未探索的分支，而不只依赖 gossip 再切分。在 `hard_9x9`、4 节点上实测：**约 1.03× → 约 4.04× 墙钟加速**（近线性），且重复工作更少。可选配 `--sync-interval` 开启周期性状态同步（崩溃恢复）。设计详见 [`docs/optimizations.zh-CN.md`](docs/optimizations.zh-CN.md)。
+
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4 \
+    --node-delay 0.002 --steal
+```
 
 #### 4. `benchmark` — 穷举搜索，真实加速
 
@@ -600,6 +659,14 @@ uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
 - **终端 2-5**：`re-bootstrapping to find submitter...` → `claiming task` →
   探索节点数不断增长 → `received SOLUTION via gossip` 或 `FOUND solution`
 - **SOLUTION 传播**：第一个找到解的节点通过 gossip 发给所有已知节点，所有人同时停止
+
+#### 8. `unsolvable` — 证明题目无解
+
+```bash
+uv run swarmsolve unsolvable --peers 4 --split-depth 3
+```
+
+节点切分搜索树、穷尽各叶子分支，并把 `DONE_EXHAUSTED` 自底向上汇报给父任务；当（多副本的）根任务被穷尽，集群即判定题目**无解**，并与单机基线交叉校验。这演示了三项优化——Random ID 探测、自底向上无解聚合、根任务多副本，详见 [`docs/optimizations.zh-CN.md`](docs/optimizations.zh-CN.md)。
 
 代码级三语详解见 [`docs/`](docs/README.md)。
 
@@ -798,6 +865,8 @@ pytest -q
 | 5 | `fault` | 求解中途殺掉節點，自動重分配 | **容錯 + 租約機制** |
 | 6 | `dashboard` | 各節點任務計數的即時儀表板 | 即時負載分佈 |
 | 7 | `peer` | 多終端機手動演示 | 互動式現場演示 |
+| 8 | `unsolvable` | 證明題目無解（自底向上聚合） | **階層化無解判定** |
+| 9 | `evaluate` | 量化實驗（自擴展性 / 彈性 / 動態加入）→ CSV | **報告 Evaluation 資料** |
 
 #### 1. `solve` — 單機基準
 
@@ -836,6 +905,13 @@ uv run swarmsolve demo --file examples/puzzles/puzzle16.txt --peers 4
 3. Wall-clock 對比
 
 **注意**：首解搜尋並行度有限（解只位於一條深路徑上），請用下面的 `benchmark` 觀察真實加速。
+
+**細粒度 work stealing（`--steal`）**：加上 `--steal`，每個繁忙節點把子樹放進一個**可被偷取的工作 deque**——空閒節點直接從繁忙節點偷走未探索的分支，而不只依賴 gossip 再切分。在 `hard_9x9`、4 節點上實測：**約 1.03× → 約 4.04× 牆鐘加速**（近線性），且重複工作更少。可選配 `--sync-interval` 開啟週期性狀態同步（當機復原）。設計詳見 [`docs/optimizations.zh-TW.md`](docs/optimizations.zh-TW.md)。
+
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4 \
+    --node-delay 0.002 --steal
+```
 
 #### 4. `benchmark` — 窮舉搜尋，真實加速
 
@@ -899,6 +975,14 @@ uv run swarmsolve peer --port 9004 --file examples/puzzles/hard_9x9.txt \
 - **終端機 2-5**：`re-bootstrapping to find submitter...` → `claiming task` →
   探索節點數不斷增長 → `received SOLUTION via gossip` 或 `FOUND solution`
 - **SOLUTION 傳播**：第一個找到解的節點通過 gossip 發給所有已知節點，所有人同時停止
+
+#### 8. `unsolvable` — 證明題目無解
+
+```bash
+uv run swarmsolve unsolvable --peers 4 --split-depth 3
+```
+
+節點切分搜尋樹、窮盡各葉子分支，並把 `DONE_EXHAUSTED` 自底向上回報給父任務；當（多副本的）根任務被窮盡，叢集即判定題目**無解**，並與單機基準交叉校驗。這演示了三項最佳化——Random ID 探測、自底向上無解聚合、根任務多副本，詳見 [`docs/optimizations.zh-TW.md`](docs/optimizations.zh-TW.md)。
 
 程式碼層級三語詳解見 [`docs/`](docs/README.md)。
 

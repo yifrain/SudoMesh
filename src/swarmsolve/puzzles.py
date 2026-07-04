@@ -82,3 +82,47 @@ def generate(n: int, *, clue_ratio: float = 0.35, seed: int | None = None) -> Bo
     for r, c in cells[:keep]:
         puzzle[r][c] = full[r][c]
     return Board.from_grid(puzzle)
+
+
+def make_unsolvable(
+    n: int = 9,
+    *,
+    clue_ratio: float = 0.45,
+    seed: int = 0,
+    attempts: int = 500,
+) -> Board:
+    """Construct a puzzle that is *provably unsolvable* but not trivially so.
+
+    Strategy: keep a subset of a valid full grid as clues, then corrupt ONE of
+    them to a different value. Boards whose clues immediately conflict are
+    skipped (we want unsolvability that only shows up after search). Each
+    candidate is verified with ``solve_local`` so the returned board is
+    guaranteed to have no solution. Used to demo/test unsolvable detection.
+    """
+    from swarmsolve.solver.board import Contradiction
+    from swarmsolve.solver.search import solve_local
+
+    for s in range(seed, seed + attempts):
+        rng = random.Random((s + 1) * 2654435761 % (2**32))
+        full = full_solution(n, seed=s)
+        cells = [(r, c) for r in range(n) for c in range(n)]
+        rng.shuffle(cells)
+        keep = max(1, int(n * n * clue_ratio))
+        kept = cells[:keep]
+        puzzle = [[0] * n for _ in range(n)]
+        for r, c in kept:
+            puzzle[r][c] = full[r][c]
+        # Corrupt one kept clue to a value different from the true solution.
+        r, c = kept[0]
+        wrong = rng.choice([v for v in range(1, n + 1) if v != full[r][c]])
+        puzzle[r][c] = wrong
+        try:
+            board = Board.from_grid(puzzle)
+        except Contradiction:
+            continue  # immediate conflict -> not interesting; try another
+        if not solve_local(board).solved:
+            return board  # verified: no solution
+    raise RuntimeError(
+        "could not construct an unsolvable puzzle; increase attempts/clue_ratio"
+    )
+

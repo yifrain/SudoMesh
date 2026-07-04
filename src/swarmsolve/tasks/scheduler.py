@@ -5,7 +5,16 @@ keeps shared state consistent with what arrives over gossip:
 
     * ``open``       : known unclaimed subtasks (dedup by task id).
     * ``dead_ends``  : ids of subtrees proven invalid -> never re-explore.
-    * ``leases``     : tasks currently claimed (by us or others) + expiry.
+    * ``claimed``    : tasks currently claimed (by us or others) + expiry.
+    * ``done``       : (legacy) subtrees fully explored with no solution.
+
+Unsolvable detection adds three more:
+
+    * ``split``      : tasks we hold the *parent bookkeeping* for (DONE_SPLIT):
+                       they carry ``children`` + ``children_exhausted``.
+    * ``exhausted``  : ids of subtrees proven to contain no solution.
+    * ``_reported``  : parent_id -> set(child_id) already counted, so repeated
+                       EXHAUSTED reports (gossip retransmission) are idempotent.
 
 Fairness & dedup: a peer prefers tasks whose ``key`` it is *responsible for*
 (closest in XOR space), which spreads work without central coordination.
@@ -33,13 +42,23 @@ class Scheduler:
         self.dead_ends: set[str] = set()
         self.claimed: dict[str, Task] = {}
         self.done: set[str] = set()
+        # ---- unsolvable-detection bookkeeping -------------------------
+        self.split: dict[str, Task] = {}          # parent tasks in DONE_SPLIT
+        self.exhausted: set[str] = set()          # task ids proven no-solution
+        self._reported: dict[str, set[str]] = {}  # parent_id -> counted child ids
+        # ---- crash-recovery backups (periodic state sync) -------------
+        # task_id -> {"frontier": [paths], "nodes": int, "ts": float}. A backup
+        # peer keeps the latest snapshot of a busy peer's unexplored frontier so
+        # that, if the owner crashes, we resume from the snapshot instead of
+        # redoing the whole subtree (only the sync-window's worth is lost).
+        self.backups: dict[str, dict] = {}
 
     # ---- ingest (from local splitting or gossip) ----------------------
 
     def add_open(self, task: Task) -> bool:
         """Register an open task. Returns False if it's a known dup/dead/done."""
         tid = task.id
-        if tid in self.dead_ends or tid in self.done:
+        if tid in self.dead_ends or tid in self.done or tid in self.exhausted:
             return False
         if tid in self.claimed and self.claimed[tid].lease_active():
             return False
@@ -57,6 +76,7 @@ class Scheduler:
         self.claimed.pop(tid, None)
 
     def mark_done(self, path: Path) -> None:
+        """(Legacy) mark a subtree fully explored (no solution)."""
         tid = path_repr(path)
         self.done.add(tid)
         self.open.pop(tid, None)
@@ -69,6 +89,67 @@ class Scheduler:
         task.status = TaskStatus.CLAIMED
         self.claimed[tid] = task
 
+    # ---- unsolvable detection -----------------------------------------
+
+    def mark_split(self, task: Task) -> None:
+        """Record that ``task`` was expanded into ``task.children`` (DONE_SPLIT).
+
+        The peer(s) responsible for ``task`` keep this record so they can later
+        count DONE_EXHAUSTED reports from the children and roll the result up.
+        """
+        tid = task.id
+        self.open.pop(tid, None)
+        self.claimed.pop(tid, None)
+        task.status = TaskStatus.DONE_SPLIT
+        task.owner = None
+        task.lease_expires = 0.0
+        # merge counters if we already had a record for this task id
+        prev = self.split.get(tid)
+        if prev is not None and prev.children_exhausted > task.children_exhausted:
+            task.children_exhausted = prev.children_exhausted
+        self.split[tid] = task
+
+    def mark_exhausted(self, path: Path) -> None:
+        """Record that a subtree was exhaustively searched with no solution."""
+        tid = path_repr(path)
+        self.exhausted.add(tid)
+        self.open.pop(tid, None)
+        self.claimed.pop(tid, None)
+
+    def note_child_exhausted(self, parent_id: str, child_id: str) -> bool:
+        """Count one child's DONE_EXHAUSTED report against ``parent_id``.
+
+        Idempotent: a repeated report for the same child is ignored. Returns True
+        once *all* of the parent's children are exhausted (parent now unsolvable).
+        Returns False if we don't hold this parent's bookkeeping yet.
+        """
+        parent = self.split.get(parent_id)
+        if parent is None:
+            return False
+        seen = self._reported.setdefault(parent_id, set())
+        if child_id not in seen:
+            seen.add(child_id)
+            parent.children_exhausted += 1
+        return parent.all_children_exhausted()
+
+    # ---- crash-recovery backups (periodic state sync) -----------------
+
+    def record_backup(self, task_id: str, frontier: list[Path], nodes: int,
+                      now: float | None = None) -> None:
+        """Store the latest frontier snapshot for a busy peer's task."""
+        self.backups[task_id] = {
+            "frontier": [list(p) for p in frontier],
+            "nodes": nodes,
+            "ts": now or time.time(),
+        }
+
+    def take_backup_frontier(self, task_id: str) -> list[Path] | None:
+        """Consume the snapshot frontier for ``task_id`` (used on recovery)."""
+        snap = self.backups.pop(task_id, None)
+        if not snap:
+            return None
+        return [[tuple(a) for a in p] for p in snap["frontier"]]
+
     # ---- selection ----------------------------------------------------
 
     def reclaim_expired(self, now: float | None = None) -> list[Task]:
@@ -80,7 +161,11 @@ class Scheduler:
                 task.status = TaskStatus.OPEN
                 task.owner = None
                 self.claimed.pop(tid, None)
-                if tid not in self.dead_ends and tid not in self.done:
+                if (
+                    tid not in self.dead_ends
+                    and tid not in self.done
+                    and tid not in self.exhausted
+                ):
                     self.open[tid] = task
                     reclaimed.append(task)
         return reclaimed
@@ -99,6 +184,17 @@ class Scheduler:
             key=lambda t: xor_distance(self.self_id, t.key),
         )
         return best
+
+    def offer_open_task(self, now: float | None = None) -> Task | None:
+        """Pick an open task to hand to a probing peer (any active one).
+
+        Used to answer a TASK_QUERY: the probed peer offers one of the open
+        tasks it currently holds so the prober can claim it (cold-start help).
+        """
+        self.reclaim_expired(now)
+        for task in self.open.values():
+            return task
+        return None
 
     def claim_local(self, task: Task, now: float | None = None) -> Task:
         """Claim a task for ourselves with a fresh lease."""
@@ -119,5 +215,7 @@ class Scheduler:
             "open": len(self.open),
             "claimed": len(self.claimed),
             "dead_ends": len(self.dead_ends),
-            "done": len(self.done),
+            "done": len(self.done) + len(self.exhausted),
+            "split": len(self.split),
+            "exhausted": len(self.exhausted),
         }

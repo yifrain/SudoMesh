@@ -12,7 +12,7 @@
 
 ```bash
 uv sync --extra dev                 # 安装依赖到 .venv
-uv run pytest -q                    # 自检：8 passed
+uv run pytest -q                    # 自检：24 passed
 # 预生成加速演示用的"宽"题：
 uv run swarmsolve gen --size 9 --clue-ratio 0.28 --seed 7 --out wide.txt
 ```
@@ -30,6 +30,7 @@ uv run swarmsolve gen --size 9 --clue-ratio 0.28 --seed 7 --out wide.txt
 | 3 | 容错 | E | 2 分 |
 | 4 | 实时仪表盘 | C | 1 分 |
 | 5 | 诚实加速 + scaling | B | 2.5 分 |
+| 5b | 加演：work stealing + 无解判定（可选） | B/E | 1.5 分 |
 | 6 | 设计权衡 | A | 1.5 分 |
 | 7 | 问答 | 全体 | 剩余 |
 
@@ -153,6 +154,38 @@ for p in 1 2 4; do uv run swarmsolve benchmark --file wide.txt --peers $p --node
 
 **[亮点]**"相对单节点，4 节点约 3×——**75% 并行效率**——且**解计数精确、约 0% 重复工作**。
 虚拟节点（一致性哈希，第5章）是负载均衡的关键——没有它，某个节点要做 47% 的工作。"
+
+---
+
+## 第 5b 部分 — 加演：work stealing 与无解判定  *（可选）*
+
+两项新增优化，各一条命令即可演示。完整设计见
+[`docs/optimizations.zh-CN.md`](optimizations.zh-CN.md)。
+
+### 细粒度 work stealing（`--steal`）
+
+**[说]**"第 2 部分里 9×9 的首解几乎没有并行。加上细粒度 **work stealing** 后，每个繁忙节点对外暴露一个**可被偷取的 deque**（未探索分支）；空闲节点通过已有的拉取通道偷走**最重的分支**（搜索空间估算），且不产生重复工作。"
+
+**[跑]**
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4 \
+    --node-delay 0.002 --steal
+```
+**[看]** 墙钟加速从第 2 部分的约 1.0× 跳到约 4×，且总探索节点更少。
+
+**[亮点]**"这是把 Chord 式 deque work stealing 融合进 Kademlia 骨架：粗粒度 gossip 播撒初始任务，细粒度偷取动态再均衡。再加 `--sync-interval 0.3` 还能把各节点的 frontier 周期性快照到备份节点，实现崩溃恢复。"
+
+### 无解判定
+
+**[说]**"集群还能**证明一道题目无解**。`DONE` 被拆成 `DONE_SPLIT`/`DONE_EXHAUSTED`；穷尽的分支沿任务树自底向上汇报，当（多副本的）根任务被穷尽，集群即宣告 UNSOLVABLE。"
+
+**[跑]**
+```bash
+uv run swarmsolve unsolvable --peers 4 --split-depth 3
+```
+**[看]** 每个节点都打印 `UNSOLVABLE`，总结确认 `verdict matches single-machine baseline`。
+
+**[亮点]**"自底向上 `DONE_EXHAUSTED` 聚合 + 根任务多副本消除了单点——无解结论在节点崩溃后依然成立。"
 
 ---
 

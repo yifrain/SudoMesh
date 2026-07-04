@@ -19,9 +19,12 @@ localhost sockets, so the CPU-bound search runs in parallel for real.
 from __future__ import annotations
 
 import asyncio
+import csv
 import multiprocessing as mp
 import queue as queuemod
+import statistics
 import time
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -31,7 +34,7 @@ from rich.table import Table
 from swarmsolve.discovery.node_id import NodeID
 from swarmsolve.discovery.routing import Contact
 from swarmsolve.peer import Peer
-from swarmsolve.puzzles import generate, load_board
+from swarmsolve.puzzles import generate, load_board, make_unsolvable
 from swarmsolve.solver.board import Board
 from swarmsolve.solver.search import solve_local
 
@@ -75,6 +78,11 @@ def _peer_worker(
                  for v in range(cfg.get("vnodes", 16))]
                 if cfg.get("exclusive") else None
             ),
+            probe_random=cfg.get("probe_random", False),
+            detect_unsolvable=cfg.get("detect_unsolvable", False),
+            root_replicas=cfg.get("root_replicas", 3),
+            steal=cfg.get("steal", False),
+            sync_interval=cfg.get("sync_interval", 0.0),
         )
         if cfg.get("report"):
             peer.on_tick = lambda snap, r=rank: q.put(("stat", r, snap))
@@ -83,6 +91,10 @@ def _peer_worker(
         if rank != 0:
             boot_id = NodeID.from_string(f"127.0.0.1:{BASE_PORT}")
             boot = [Contact(boot_id, "127.0.0.1", BASE_PORT)]
+        # Churn experiment: late-joining peers start after ``join_delay`` so we
+        # can measure dynamic-join self-scalability (do they still get work?).
+        if rank >= cfg.get("join_rank", cfg["peers"]):
+            await asyncio.sleep(cfg.get("join_delay", 0.0))
         await peer.start(boot)
         await asyncio.sleep(cfg["settle"])
 
@@ -96,7 +108,8 @@ def _peer_worker(
             q.put(("stat", rank, peer.snapshot()))
         await peer.stop()
         q.put(("result", rank, sol.to_flat() if sol else None,
-               peer.nodes_expanded, peer.tasks_done, dt, peer.solutions))
+               peer.nodes_expanded, peer.tasks_done, dt, peer.solutions,
+               peer.unsolvable))
 
     asyncio.run(main())
 
@@ -123,9 +136,10 @@ def _collect(procs, q, on_stat=None) -> dict:
         except queuemod.Empty:
             continue
         if item[0] == "result":
-            _, rank, sol, nodes, done, dt, sols = item
+            _, rank, sol, nodes, done, dt, sols = item[:7]
+            uns = item[7] if len(item) > 7 else False
             results[rank] = {"sol": sol, "nodes": nodes, "done": done,
-                             "dt": dt, "solutions": sols}
+                             "dt": dt, "solutions": sols, "unsolvable": uns}
         elif item[0] == "stat" and on_stat is not None:
             on_stat(item[1], item[2])
     return results
@@ -195,14 +209,23 @@ def demo(
     ),
     split_depth: int = typer.Option(2, help="Work-stealing: re-split tasks below this depth"),
     lease: float = typer.Option(5.0, help="Task lease seconds"),
+    steal: bool = typer.Option(
+        False, help="Fine-grained work stealing: idle peers steal branches from "
+                    "busy peers' deque (Chord-style) instead of only gossip re-split"
+    ),
+    sync_interval: float = typer.Option(
+        0.0, help="Periodic state sync (s): busy peers snapshot their frontier to "
+                  "backups for crash recovery (0 = off; needs --steal)"
+    ),
     seed: int = typer.Option(0, help="RNG seed for generation"),
 ) -> None:
     """Run a real local P2P swarm and compare it to the single-machine baseline."""
     board = _load_or_generate(file, size, seed)
     target = tasks or (peers * 2)
     n = board.n
+    mode = "work-stealing deque" if steal else "gossip + re-split"
     console.print(f"[bold]Puzzle {n}x{n}, peers={peers}, node_delay={node_delay}s, "
-                  f"split_depth={split_depth}[/]")
+                  f"split_depth={split_depth}, mode={mode}[/]")
     console.print(str(board))
 
     console.print("\n[bold]1) Single-machine baseline[/]")
@@ -213,7 +236,9 @@ def demo(
 
     console.print("\n[bold]2) P2P swarm[/]")
     cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
-           "settle": 0.6, "report": False}
+           "settle": 0.6, "report": False, "steal": steal,
+           "probe_random": steal, "sync_interval": sync_interval,
+           "idle_limit": 60 if steal else 30}
     procs, q = _spawn(peers, n, board.to_flat(), target, cfg)
     swarm_t0 = time.perf_counter()
     results = _collect(procs, q)
@@ -340,6 +365,83 @@ def benchmark(
         sp = base_dt / swarm_dt
         color = "green" if sp >= 1 else "yellow"
         console.print(f"   [{color}]speedup  : {sp:.2f}x (wall clock)[/]")
+
+
+# --------------------------------------------------------------------------- #
+# unsolvable — prove NO solution via bottom-up DONE_EXHAUSTED aggregation
+# --------------------------------------------------------------------------- #
+@app.command()
+def unsolvable(
+    file: str = typer.Option("", help="Unsolvable puzzle file (else generated)"),
+    size: int = typer.Option(9, help="Generated puzzle size if no file given"),
+    peers: int = typer.Option(4, help="Number of peers (processes)"),
+    node_delay: float = typer.Option(0.0, help="Per-node cost (s); demo knob"),
+    split_depth: int = typer.Option(2, help="Tree split depth (more/smaller subtasks)"),
+    lease: float = typer.Option(8.0, help="Task lease seconds"),
+    seed: int = typer.Option(21, help="RNG seed for the generated unsolvable puzzle"),
+) -> None:
+    """Prove a puzzle has NO solution via hierarchical unsolvable detection.
+
+    Peers split the tree, exhaust leaf branches, and report DONE_EXHAUSTED up to
+    their parents; when the (replicated) root task becomes exhausted, the swarm
+    declares the puzzle unsolvable. Random-id probing helps idle peers pull work.
+    """
+    board = load_board(file) if file else make_unsolvable(size, seed=seed, clue_ratio=0.30)
+    n = board.n
+    console.print(f"[bold]Unsolvable detection: {n}x{n}, peers={peers}, "
+                  f"split_depth={split_depth}[/]")
+    console.print(str(board))
+
+    console.print("\n[bold]1) Single-machine baseline[/]")
+    t0 = time.perf_counter()
+    base = solve_local(board.clone(), node_delay=node_delay)
+    base_dt = time.perf_counter() - t0
+    verdict = "SOLVED" if base.solved else "NO SOLUTION"
+    console.print(f"   baseline: {verdict} in {base_dt:.3f}s, "
+                  f"{base.stats.nodes_expanded} nodes")
+
+    console.print("\n[bold]2) P2P swarm (bottom-up DONE_EXHAUSTED aggregation)[/]")
+    cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
+           "settle": 0.5, "report": False, "detect_unsolvable": True,
+           "probe_random": True, "root_replicas": min(peers, 3), "idle_limit": 60}
+    procs, q = _spawn(peers, n, board.to_flat(), peers * 4, cfg)
+    swarm_t0 = time.perf_counter()
+    results = _collect(procs, q)
+    for p in procs:
+        p.join()
+    swarm_dt = time.perf_counter() - swarm_t0
+
+    any_unsolvable = any(r.get("unsolvable") for r in results.values())
+    any_solution = any(r.get("sol") for r in results.values())
+    total_nodes = sum(r["nodes"] for r in results.values())
+
+    table = Table(title="Per-peer report (unsolvable detection)")
+    for col in ("peer", "nodes", "tasks_done", "verdict"):
+        table.add_column(col)
+    for rank in range(peers):
+        r = results.get(rank)
+        if r is None:
+            table.add_row(str(rank), "-", "-", "-")
+        else:
+            v = ("[red]UNSOLVABLE[/]" if r.get("unsolvable")
+                 else "[green]SOLVED[/]" if r.get("sol") else "-")
+            table.add_row(str(rank), str(r["nodes"]), str(r["done"]), v)
+    console.print(table)
+
+    console.print("\n[bold]3) Summary[/]")
+    console.print(f"   baseline : {verdict}")
+    console.print(f"   swarm    : {swarm_dt:.3f}s wall, {total_nodes} nodes "
+                  f"across {peers} peers")
+    if any_solution:
+        console.print("   [green]swarm found a SOLUTION[/]")
+    elif any_unsolvable:
+        console.print("   [red]swarm proved the puzzle UNSOLVABLE "
+                      "(root task exhausted, bottom-up)[/]")
+    else:
+        console.print("   [yellow]swarm did not reach a verdict "
+                      "(try more peers / higher split_depth / idle_limit)[/]")
+    if base.solved == any_solution and (not base.solved) == any_unsolvable:
+        console.print("   [green]verdict matches single-machine baseline[/]")
 
 
 # --------------------------------------------------------------------------- #
@@ -496,6 +598,211 @@ def peer(
         await p.stop()
 
     asyncio.run(main())
+
+
+# --------------------------------------------------------------------------- #
+# evaluate — quantitative Evaluation experiments (for the project report)
+# --------------------------------------------------------------------------- #
+def _run_swarm(n, flat, peers, target, cfg, *, kill_peer=None, kill_after=0.0):
+    """Spawn a swarm, optionally kill one peer mid-run, return (wall_dt, results)."""
+    procs, q = _spawn(peers, n, flat, target, cfg)
+    t0 = time.perf_counter()
+    if kill_peer is not None:
+        time.sleep(kill_after)
+        if 0 <= kill_peer < peers and procs[kill_peer].is_alive():
+            procs[kill_peer].terminate()
+    results = _collect(procs, q)
+    for p in procs:
+        p.join()
+    return time.perf_counter() - t0, results
+
+
+def _write_csv(out: "Path | None", name: str, header: list, rows: list) -> None:
+    if out is None:
+        return
+    path = out / name
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(header)
+        w.writerows(rows)
+    console.print(f"   [dim]wrote {path}[/]")
+
+
+def _eval_scaling(board, n, peers_list, repeats, node_delay, split_depth, out):
+    """Experiment 1: self-scalability — speedup/efficiency/throughput vs #peers."""
+    console.print("\n[bold]Experiment 1 — Self-scalability[/] "
+                  "(exhaustive search, exclusive single-owner mode)")
+    base_times = []
+    base = None
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        base = solve_local(board.clone(), node_delay=node_delay, enumerate_all=True)
+        base_times.append(time.perf_counter() - t0)
+    base_dt = statistics.median(base_times)
+    console.print(f"   baseline (1 machine): median {base_dt:.3f}s, "
+                  f"{base.stats.solutions} solutions, {base.stats.nodes_expanded} nodes")
+
+    plist = [int(x) for x in peers_list.split(",") if x.strip()]
+    rows = []
+    one_dt = None
+    for p in plist:
+        cfg = {"lease": 8.0, "node_delay": node_delay, "split_depth": split_depth,
+               "settle": 0.5, "report": False, "enumerate": True, "exclusive": True,
+               "vnodes": 16, "idle_limit": 30}
+        dts, nodes, sols = [], 0, 0
+        for _ in range(repeats):
+            dt, res = _run_swarm(n, board.to_flat(), p, p * 64, cfg)
+            dts.append(dt)
+            nodes = sum(r["nodes"] for r in res.values())
+            sols = sum(r["solutions"] for r in res.values())
+        med = statistics.median(dts)
+        if p == 1:
+            one_dt = med
+        rows.append([p, round(med, 3), round(base_dt / med, 2),
+                     round(one_dt / med, 2) if one_dt else "-",
+                     round((one_dt / med) / p, 2) if one_dt else "-",
+                     int(nodes / med) if med else 0, sols])
+
+    table = Table(title="Self-scalability")
+    for c in ("peers", "wall(s)", "speedup/base", "speedup/1", "efficiency",
+              "throughput(nodes/s)", "solutions"):
+        table.add_column(c)
+    for r in rows:
+        table.add_row(*[str(x) for x in r])
+    console.print(table)
+    _write_csv(out, "scaling.csv",
+               ["peers", "wall_s", "speedup_vs_base", "speedup_vs_1",
+                "efficiency", "throughput_nodes_per_s", "solutions"], rows)
+
+
+def _eval_resilience(board, n, peers, repeats, node_delay, split_depth, out):
+    """Experiment 2: resilience — completion + recovery overhead under a crash."""
+    console.print("\n[bold]Experiment 2 — Resilience[/] "
+                  "(random crash, exhaustive so every task MUST complete)")
+    cfg = {"lease": 1.5, "node_delay": node_delay,
+           "split_depth": max(split_depth, 3), "settle": 0.5, "report": False,
+           "enumerate": True, "idle_limit": 80}
+
+    no_fault = []
+    # Ground-truth exact solution count (single machine, no delay -> fast).
+    exact = solve_local(board.clone(), enumerate_all=True).stats.solutions
+    for _ in range(repeats):
+        dt, res = _run_swarm(n, board.to_flat(), peers, peers * 2, cfg)
+        sols = sum(r["solutions"] for r in res.values())
+        no_fault.append((dt, sols >= exact))
+    base_med = statistics.median([d for d, _ in no_fault])
+    base_ok = 100.0 * sum(1 for _, ok in no_fault if ok) / len(no_fault)
+    kill_after = max(0.6, base_med * 0.4)
+
+    killed = []
+    for _ in range(repeats):
+        dt, res = _run_swarm(n, board.to_flat(), peers, peers * 2, cfg,
+                             kill_peer=peers // 2, kill_after=kill_after)
+        sols = sum(r["solutions"] for r in res.values())
+        # All solutions still found (>= exact) => the crashed peer's task was
+        # reclaimed and re-explored; nothing was lost. (Non-exclusive mode may
+        # over-count via duplication, so we test >= exact, not ==.)
+        killed.append((dt, sols >= exact))
+    kill_med = statistics.median([d for d, _ in killed])
+    success = 100.0 * sum(1 for _, ok in killed if ok) / len(killed)
+
+    rows = [
+        ["no-fault", repeats, round(base_ok, 1), round(base_med, 3), "0.000"],
+        [f"kill-1 (peer {peers // 2})", repeats, round(success, 1),
+         round(kill_med, 3), round(kill_med - base_med, 3)],
+    ]
+    table = Table(title=f"Resilience (peers={peers}, kill@{kill_after:.1f}s, "
+                        f"exact solutions={exact})")
+    for c in ("scenario", "runs", "completion %", "median wall(s)", "recovery overhead(s)"):
+        table.add_column(c)
+    for r in rows:
+        table.add_row(*[str(x) for x in r])
+    console.print(table)
+    console.print("   [dim]completion % = runs that still found ALL solutions "
+                  "(>= exact count) despite the crash — i.e. the dead peer's task "
+                  "was reclaimed via lease expiry and re-explored.[/]")
+    _write_csv(out, "resilience.csv",
+               ["scenario", "runs", "completion_pct", "median_wall_s",
+                "recovery_overhead_s"], rows)
+
+
+def _eval_churn(board, n, peers, node_delay, split_depth, out):
+    """Experiment 3: churn — do late-joining peers pick up work (dynamic scaling)?"""
+    console.print("\n[bold]Experiment 3 — Churn / dynamic join[/] "
+                  "(half the peers join late; work stealing enabled)")
+    join_rank = max(1, peers // 2)
+    cfg = {"lease": 8.0, "node_delay": node_delay,
+           "split_depth": max(split_depth, 3), "settle": 0.5, "report": False,
+           "enumerate": True, "exclusive": False, "idle_limit": 100,
+           "steal": True, "probe_random": True,
+           "join_rank": join_rank, "join_delay": 1.5}
+    dt, res = _run_swarm(n, board.to_flat(), peers, peers * 2, cfg)
+
+    total = sum(r["nodes"] for r in res.values()) or 1
+    late = sum(r["nodes"] for rank, r in res.items() if rank >= join_rank)
+    rows = []
+    for rank in range(peers):
+        r = res.get(rank)
+        joined = "late" if rank >= join_rank else "early"
+        if r is None:
+            rows.append([rank, joined, 0, 0])
+        else:
+            rows.append([rank, joined, r["nodes"], r["done"]])
+    table = Table(title=f"Churn (peers={peers}, late joiners join +1.5s)")
+    for c in ("peer", "join", "nodes", "tasks_done"):
+        table.add_column(c)
+    for r in rows:
+        table.add_row(*[str(x) for x in r])
+    console.print(table)
+    console.print(f"   wall={dt:.3f}s · late joiners did "
+                  f"[bold]{100.0 * late / total:.1f}%[/] of the work "
+                  f"→ the swarm absorbed nodes that joined after tasks were seeded "
+                  f"(self-scalability under churn).")
+    _write_csv(out, "churn.csv", ["peer", "join", "nodes", "tasks_done"], rows)
+
+
+@app.command()
+def evaluate(
+    suite: str = typer.Option("all", help="scaling | resilience | churn | all"),
+    file: str = typer.Option("", help="Puzzle file (else one is generated)"),
+    size: int = typer.Option(9, help="Generated puzzle size if no file given"),
+    seed: int = typer.Option(7, help="RNG seed for generation"),
+    peers_list: str = typer.Option("1,2,4", help="Peer counts for the scaling sweep"),
+    peers: int = typer.Option(4, help="Peers for resilience/churn experiments"),
+    repeats: int = typer.Option(3, help="Repetitions per data point (median)"),
+    node_delay: float = typer.Option(0.0003, help="Per-node cost (s); models expensive search"),
+    split_depth: int = typer.Option(3, help="Split / work-stealing depth"),
+    clue_ratio: float = typer.Option(
+        0.28, help="Clue fraction when generating (lower = bigger search tree). "
+                   "A wide tree is needed for a meaningful exhaustive workload."
+    ),
+    csv_dir: str = typer.Option("", help="If set, write CSV files here for plotting"),
+) -> None:
+    """Quantitative Evaluation experiments for the project report.
+
+    Produces the numbers/figures the report's Evaluation chapter needs:
+    self-scalability (speedup/efficiency/throughput vs #peers), resilience
+    (completion + recovery overhead under a random crash), and churn (late
+    joiners picking up work). Use ``--csv-dir`` to dump CSVs for plotting.
+
+    NOTE: meaningful parallel speedup needs a substantial workload, so by default
+    we generate a *wide* puzzle (low clue ratio -> large exhaustive search tree).
+    A tiny puzzle is dominated by process-startup / settle overhead.
+    """
+    board = load_board(file) if file else generate(size, clue_ratio=clue_ratio, seed=seed)
+    n = board.n
+    out = Path(csv_dir) if csv_dir else None
+    if out is not None:
+        out.mkdir(parents=True, exist_ok=True)
+    console.print(f"[bold]Evaluation on {n}x{n} (seed={seed}, clue_ratio={clue_ratio}), "
+                  f"repeats={repeats}[/]")
+
+    if suite in ("scaling", "all"):
+        _eval_scaling(board, n, peers_list, repeats, node_delay, split_depth, out)
+    if suite in ("resilience", "all"):
+        _eval_resilience(board, n, peers, repeats, node_delay, split_depth, out)
+    if suite in ("churn", "all"):
+        _eval_churn(board, n, peers, node_delay, split_depth, out)
 
 
 if __name__ == "__main__":
