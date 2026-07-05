@@ -608,7 +608,7 @@ the key — propagates, so there is no `k²` fan-out). When the **root**
 
 | Failure | Mechanism |
 |---------|-----------|
-| **Guard failure** | the surviving replicas route to the next (`k+1`-th) nearest peer to the task key and transfer the record to it |
+| **Guard failure** | a periodic, primary-guard, throttled re-`PUT` ([`_guard_maintain_replicas`](../src/swarmsolve/peer.py)) re-replicates records to the *current* guard set, so the peer now `k+1`-th nearest is promoted and receives the record — restoring `k`-way replication after a guard departs |
 | **Thief failure** | the guard detects lease expiry (`expired_claims`), reverts `CLAIMED → OPEN` and `UPDATE_STATUS`-syncs the co-guards |
 | **Race conditions** | two guards handing out the same task is resolved deterministically by timestamps in [`GuardStore.put`](../src/swarmsolve/tasks/guard.py) — **earliest claim wins**, the loser thief aborts; completed states are never regressed (monotonic progress) |
 

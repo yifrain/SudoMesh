@@ -162,6 +162,7 @@ class Peer:
         self.max_split_depth = max_split_depth
         self.guards = GuardStore(lease_seconds=lease_seconds)
         self._guard_hb_last = 0.0
+        self._guard_maint_last = 0.0
         self.steals_ok = 0
         self.steals_fail = 0
         self._pending_steal: dict[str, asyncio.Future] = {}
@@ -614,6 +615,7 @@ class Peer:
         while not self._stop.is_set():
             self._maybe_tick()
             await self._guard_reclaim_expired()      # guard duty: watch leases
+            await self._guard_maintain_replicas()    # guard duty: self-heal replicas
             task = self._claim_local_open()          # cold-start Opt A
             if task is None:
                 task = await self._steal_random()    # random-key work stealing
@@ -782,6 +784,23 @@ class Peer:
                     self.log(f"[{self.id.short()}] lease expired on "
                              f"{rec.task_id[:16]}...; reverting to OPEN")
                     await self._guard_broadcast(reverted)
+
+    async def _guard_maintain_replicas(self) -> None:
+        """Self-heal replication: re-PUT records to the *current* guard set.
+
+        When a guard departs, the peer now ``(k+1)``-th nearest to a key is
+        promoted into that key's guard set. Periodically re-broadcasting the
+        records we (as primary guard) hold transfers their state onto any
+        newly-promoted guard, restoring ``k``-way replication after guard failure.
+        Throttled + primary-only, so extra traffic stays O(#my-tasks)/period.
+        """
+        now = time.monotonic()
+        if now - self._guard_maint_last < max(1.0, self.lease_seconds * 0.5):
+            return
+        self._guard_maint_last = now
+        for rec in list(self.guards.records.values()):
+            if self._is_primary_guard(task_key(rec.task_id)):
+                await self._guard_broadcast(rec)
 
     # ---- guard inbound handlers --------------------------------------
 
