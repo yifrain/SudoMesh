@@ -487,6 +487,7 @@ stateDiagram-v2
 | **Task pull (Opt 1)** | `TASK_QUERY` / `TASK_OFFER` | **new** |
 | **Unsolvable aggregation (Opt 2)** | `SPLIT_REPORT` / `EXHAUSTED_REPORT` | **new** (or reuse `TASK_DONE` + `kind`) |
 | **State sync (work-stealing crash recovery)** | `STATE_SYNC` | **new** |
+| **Task Guards (Opt 4)** | `WORK_STEAL` / `UPDATE_STATUS` / `REPORT_SPLIT` / `REPORT_EXHAUSTED` / `REPORT_CHILD_EXHAUSTED` / `HEARTBEAT` | **new** (see §7) |
 | Discovery | `PING` / `PONG` / `FIND_NODE` / `FIND_NODE_REPLY` | existing |
 | Gossip | `GOSSIP_PUSH` | existing |
 
@@ -519,3 +520,118 @@ Land in three dependency-ordered steps, each independently testable and backward
 | Unsolvable detection | impossible | `DONE_SPLIT/DONE_EXHAUSTED` bottom-up aggregation; deterministic root verdict |
 | Root node | single point, disabled on crash | k replicas jointly own, crash-tolerant |
 | Crash recovery | whole subtree redone after lease expiry | periodic snapshot + resume from frontier, only sync-window progress lost |
+
+---
+
+## 7. Optimization 4: Task Guards (Kademlia-native non-exclusive mode)
+
+> Code: [`tasks/guard.py`](../src/swarmsolve/tasks/guard.py) (`GuardStore`/`GuardRecord`),
+> guard mode in [`peer.py`](../src/swarmsolve/peer.py); enable with `--guard`
+> (e.g. `swarmsolve demo --guard`, `swarmsolve unsolvable --guard`).
+
+### 7.1 The problem it fixes
+
+Optimizations 1–3 still lean on **gossip** to move task-state around
+(`TASK_CLAIM`, `SPLIT_REPORT`, `EXHAUSTED_REPORT` are broadcast). At scale this
+is high network overhead and invites duplicate exploration: everybody hears about
+every task even though only a handful of peers care.
+
+### 7.2 Strategy: store tasks on their k guards
+
+Instead of keeping a task isolated on one node (basic XOR placement) or gossiping
+its state, we adopt the *traditional* Kademlia methodology: a task is hashed to a
+key and **stored on the `k` nearest peers — its Task Guards** (`--guard-k`, default 3).
+
+A guard keeps a small tracking record and **all state-sync is point-to-point TCP**
+among the ≤`k` guards, never gossip. A global gossip broadcast happens **only** when
+a valid solution (or the final unsolvable verdict) is found.
+
+```
+{ "task_id", "path", "state": OPEN|CLAIMED|DONE_SPLIT|DONE_EXHAUSTED,
+  "holder", "lease_expire", "children", "children_exhausted", "parent_id", "ts" }
+```
+
+### 7.3 Active work stealing (the thief cycle)
+
+```mermaid
+sequenceDiagram
+    participant Thief as Idle peer (thief)
+    participant G as Guard of a task
+    participant CG as Child-task guards
+    Thief->>Thief: cold-start Opt A: any OPEN task I guard locally? -> self-claim
+    Thief->>G: random-key Kademlia lookup (alpha=3) -> nearest peer -> WORK_STEAL
+    G->>G: try_claim(OPEN->CLAIMED, holder=thief, lease)
+    G-->>G: UPDATE_STATUS to the other k-1 guards
+    G-->>Thief: TASK_OFFER (the task)
+    Thief->>Thief: sudoku_search() BFS up to max_split_depth
+    Thief->>CG: PUT children (T2..Tn) as OPEN
+    Thief->>G: REPORT_SPLIT (parent -> DONE_SPLIT + children)
+    Note over Thief: Opt B: instant-self-claim T1 -> zero idle time
+    Thief->>G: HEARTBEAT (keep lease) while computing
+```
+
+1. **Local responsibility first (cold-start Opt A).** Before probing, a free peer
+   checks if it already guards any `OPEN` task; if so it self-claims and runs it —
+   no network round-trip. This directly attacks the `Peers ≫ Tasks` starvation of
+   the cold-start phase.
+2. **Random-key steal.** Otherwise it generates a random key and runs a Kademlia
+   node lookup (parallel `FIND_NODE`, α = 3) to find the nearest active peer, then
+   issues a direct TCP `WORK_STEAL`.
+3. **Lease.** The guard moves the task `OPEN → CLAIMED(holder, lease)`, syncs it to
+   the other guards, and hands the task over; it then monitors the thief's
+   `HEARTBEAT`s until the final outcome.
+4. **Split & instant self-claim (Opt B).** On receiving a task the thief runs
+   `sudoku_search()` (BFS to `max_split_depth`), `PUT`s the child subtasks to their
+   guards, `REPORT_SPLIT`s to the parent's guards, and **instantly self-claims one
+   child** for its next cycle — only the *remaining* children go to the DHT for
+   other thieves. Zero CPU idle time post-split (eliminates search-after-split).
+
+### 7.4 Outcomes
+
+* **Solved.** The thief sends the solution to the guards for verification; once
+  verified it is gossiped globally to trigger immediate parallel termination.
+* **Dead end.** The thief `REPORT_EXHAUSTED`s to the task's guards; each marks the
+  task `DONE_EXHAUSTED`, and the exhaustion is tallied against the parent
+  (`REPORT_CHILD_EXHAUSTED`).
+
+### 7.5 Unsolvable puzzles — hierarchical bottom-up exhaustion
+
+When a leaf branch is exhausted, its guards `REPORT_CHILD_EXHAUSTED` to the parent
+task's guards, which increment `children_exhausted`. When
+`children_exhausted == len(children)` the parent itself becomes `DONE_EXHAUSTED`
+and rolls up one more level (only the *primary* guard — the single closest peer to
+the key — propagates, so there is no `k²` fan-out). When the **root**
+(`parent_id == null`) becomes exhausted, the root guards broadcast a global
+`NO_SOLUTION` verdict. This is the exact 6-step trace in the design spec.
+
+### 7.6 Fault tolerance & self-healing
+
+| Failure | Mechanism |
+|---------|-----------|
+| **Guard failure** | the surviving replicas route to the next (`k+1`-th) nearest peer to the task key and transfer the record to it |
+| **Thief failure** | the guard detects lease expiry (`expired_claims`), reverts `CLAIMED → OPEN` and `UPDATE_STATUS`-syncs the co-guards |
+| **Race conditions** | two guards handing out the same task is resolved deterministically by timestamps in [`GuardStore.put`](../src/swarmsolve/tasks/guard.py) — **earliest claim wins**, the loser thief aborts; completed states are never regressed (monotonic progress) |
+
+### 7.7 RPC API (registered in `transport/messages.py`)
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `WORK_STEAL` | thief → guard | request an OPEN task |
+| `UPDATE_STATUS` | guard → other k-1 guards | sync a task's record (last-writer-wins) |
+| `REPORT_SPLIT` | thief → task's guards | task expanded into child keys (→ DONE_SPLIT) |
+| `REPORT_EXHAUSTED` | thief → task's guards | leaf branch invalid (→ DONE_EXHAUSTED) |
+| `REPORT_CHILD_EXHAUSTED` | child guards → parent guards | recursive bottom-up tally |
+| `HEARTBEAT` | thief → guard | keep the lease alive |
+
+### 7.8 Why this is better, and its one risk
+
+* **Reduced overhead** — intensive state-sync is confined to a group of `k` guards
+  over point-to-point TCP; only the final solution is gossiped network-wide.
+* **Structured indirect storage** — task management is native to the Kademlia DHT,
+  and work-stealing reuses the *same* parallel structural routing for target
+  location.
+* **Comprehensive resilience** — guard failure, thief failure, dynamic arrivals,
+  and decentralized load balancing are all handled.
+* **Risk — cold start.** While `Peers ≫ Tasks` early on, steals fail often (most
+  contacted peers hold no task yet). Opt A (local self-claim) + Opt B (self-claim
+  after split) mitigate it, and it dissipates naturally as the search tree branches.

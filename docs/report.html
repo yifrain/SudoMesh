@@ -224,6 +224,7 @@ message carries `type, sender, payload, msg_id, ttl, ts`. Full schemas in Append
 | Task pull (cold start / stealing) | `TASK_QUERY`, `TASK_OFFER` |
 | Unsatisfiability aggregation | `SPLIT_REPORT`, `EXHAUSTED_REPORT` |
 | Crash recovery | `STATE_SYNC` |
+| Task Guards (§4.8) | `WORK_STEAL`, `UPDATE_STATUS`, `REPORT_SPLIT`, `REPORT_EXHAUSTED`, `REPORT_CHILD_EXHAUSTED`, `HEARTBEAT` |
 | Gossip envelope | `GOSSIP_PUSH` |
 
 *Table 2. Self-defined message types.*
@@ -293,8 +294,29 @@ sequenceDiagram
 ### 4.7 Module decomposition
 
 `transport/` (I/O), `discovery/` (Kademlia), `gossip/` (epidemic spread), `tasks/` (split /
-dedup / lease / steal / aggregate), `solver/` (search), `peer.py` (orchestration), `cli.py`
-(demos + evaluation).
+dedup / lease / steal / aggregate / **guards**), `solver/` (search), `peer.py` (orchestration),
+`cli.py` (demos + evaluation).
+
+### 4.8 Task Guards: DHT-native non-exclusive coordination
+
+The modes above still move task state over **gossip** (`TASK_CLAIM`, `SPLIT_REPORT`,
+`EXHAUSTED_REPORT` are broadcast), which is high overhead at scale. The *Task Guards* model
+(`--guard`, `tasks/guard.py`) adopts the traditional Kademlia methodology: a task is hashed to
+a key and stored (`PUT`) on its `k` nearest peers — its **guards** — which hold a small
+tracking record `{state, holder, lease_expire, children, children_exhausted, parent_id, ts}`
+and coordinate **purely by point-to-point TCP** (`UPDATE_STATUS`). A global gossip broadcast
+fires **only** for the final `SOLUTION` / unsolvable verdict.
+
+An idle peer acts as a *thief*: (i) cold-start **Opt A** — self-claim any `OPEN` task it
+already guards; else (ii) a random-key Kademlia lookup (parallel `FIND_NODE`, α=3) to the
+nearest active peer plus a direct `WORK_STEAL`. On receiving a task it runs `sudoku_search()`
+(BFS to `max_split_depth`), `PUT`s the child subtasks, `REPORT_SPLIT`s to the parent's guards,
+and **Opt B** instantly self-claims one child (zero idle time). Guards issue time-boxed leases
+and watch the thief's `HEARTBEAT`s. Resilience is comprehensive: a failed guard's record moves
+to the `k+1`-th nearest peer; a failed thief's lease expires and the task reverts to `OPEN`; a
+two-guard hand-out race is resolved deterministically by timestamps (earliest claim wins).
+Unsolvability uses the same bottom-up roll-up (§4.6) carried over guard
+`REPORT_CHILD_EXHAUSTED` RPCs instead of gossip.
 
 ## 5. Implementation
 
@@ -456,6 +478,12 @@ children_exhausted, parent_id`. `DEAD_END` / `TASK_DONE`: a `path` list of `[cel
 `TASK_OFFER`: a task. `SPLIT_REPORT`: a task; `EXHAUSTED_REPORT`: `parent_id, child_id`.
 `STATE_SYNC`: `task_id, frontier (list of paths), nodes`. `FIND_NODE`: `target`;
 `FIND_NODE_REPLY`: `target, nodes (id/host/port), reply_to`.
+
+**Task Guards RPCs (§4.8, point-to-point TCP).** `WORK_STEAL`: `host, port, reply_to` (reply
+reuses `TASK_OFFER` carrying the task or `null`). `UPDATE_STATUS`: a full record `task_id, path,
+parent_id, state, holder, lease_expire, children, children_exhausted, ts`. `REPORT_SPLIT`:
+`task_id, path, parent_id, children`. `REPORT_EXHAUSTED`: `task_id, path, parent_id`.
+`REPORT_CHILD_EXHAUSTED`: `parent_id, child_id`. `HEARTBEAT`: `task_id`.
 
 ### B. Key algorithms (source locations)
 

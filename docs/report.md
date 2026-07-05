@@ -226,8 +226,32 @@ sequenceDiagram
 ### 4.7 Module decomposition
 
 `transport/` (I/O), `discovery/` (Kademlia), `gossip/` (epidemic spread), `tasks/`
-(split/dedup/lease/steal/aggregate), `solver/` (search), `peer.py` (orchestration),
-`cli.py` (demos + evaluation).
+(split/dedup/lease/steal/aggregate/**guards**), `solver/` (search), `peer.py`
+(orchestration), `cli.py` (demos + evaluation).
+
+### 4.8 Task Guards: DHT-native non-exclusive coordination
+
+The modes above still move task state over **gossip** (`TASK_CLAIM`, `SPLIT_REPORT`,
+`EXHAUSTED_REPORT` are broadcast), which is high overhead at scale. The *Task
+Guards* model (`--guard`, [`tasks/guard.py`](../src/swarmsolve/tasks/guard.py))
+adopts the traditional Kademlia methodology: a task is hashed to a key and stored
+(`PUT`) on its `k` nearest peers — its **guards** — which hold a small tracking
+record `{state, holder, lease_expire, children, children_exhausted, parent_id, ts}`
+and coordinate **purely by point-to-point TCP** (`UPDATE_STATUS`). A global gossip
+broadcast is triggered **only** for the final `SOLUTION` / unsolvable verdict.
+
+An idle peer acts as a *thief*: (i) cold-start **Opt A** — self-claim any `OPEN`
+task it already guards; else (ii) a random-key Kademlia lookup (parallel
+`FIND_NODE`, α=3) to the nearest active peer + a direct `WORK_STEAL`. On receiving
+a task it runs `sudoku_search()` (BFS to `max_split_depth`), `PUT`s the child
+subtasks, `REPORT_SPLIT`s to the parent's guards, and **Opt B** instantly
+self-claims one child (zero idle time). Guards issue time-boxed leases and watch
+the thief's `HEARTBEAT`s. Resilience is comprehensive: a failed guard's record
+moves to the `k+1`-th nearest peer; a failed thief's lease expires and the task
+reverts to `OPEN`; and a two-guard hand-out race is resolved deterministically by
+timestamps (earliest claim wins). Unsolvability is proved by the same hierarchical
+bottom-up roll-up (§4.6) but carried over guard `REPORT_CHILD_EXHAUSTED` RPCs
+instead of gossip. Full design: [`docs/optimizations.en.md`](optimizations.en.md) §7.
 
 ---
 
@@ -391,6 +415,13 @@ children_exhausted, parent_id}}`. `DEAD_END`/`TASK_DONE`: `{"path": [[cell,val],
 `{host, port}`; `TASK_OFFER`: `{task}`. `SPLIT_REPORT`: `{task}`; `EXHAUSTED_REPORT`:
 `{parent_id, child_id}`. `STATE_SYNC`: `{task_id, frontier: [[...paths]], nodes}`.
 `FIND_NODE`: `{target}`; `FIND_NODE_REPLY`: `{target, nodes:[{id,host,port}], reply_to}`.
+
+**Task Guards RPCs (§4.8, point-to-point TCP).** `WORK_STEAL`: `{host, port, reply_to}`;
+reply reuses `TASK_OFFER`: `{task | null, reply_to}`. `UPDATE_STATUS`:
+`{record: {task_id, path, parent_id, state, holder, lease_expire, children,
+children_exhausted, ts}}`. `REPORT_SPLIT`: `{task_id, path, parent_id, children}`.
+`REPORT_EXHAUSTED`: `{task_id, path, parent_id}`. `REPORT_CHILD_EXHAUSTED`:
+`{parent_id, child_id}`. `HEARTBEAT`: `{task_id}`.
 
 ### B. Key pseudo-code
 

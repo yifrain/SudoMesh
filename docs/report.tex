@@ -209,6 +209,7 @@ canonical string of its assignment path (e.g.\ \code{12=4;37=9}) and its key is 
     Task pull (cold start / stealing) & \code{TASK\_QUERY}, \code{TASK\_OFFER}\\
     Unsatisfiability aggregation & \code{SPLIT\_REPORT}, \code{EXHAUSTED\_REPORT}\\
     Crash recovery & \code{STATE\_SYNC}\\
+    Task Guards (\S\ref{subsec:guards}) & \code{WORK\_STEAL}, \code{UPDATE\_STATUS}, \code{REPORT\_SPLIT}, \code{REPORT\_EXHAUSTED}, \code{REPORT\_CHILD\_EXHAUSTED}, \code{HEARTBEAT}\\
     Gossip envelope & \code{GOSSIP\_PUSH}\\
     \bottomrule
   \end{tabular}
@@ -245,7 +246,7 @@ CPU-bound DFS periodically yields so inbound messages are served while computing
         around dead peers.
 \end{itemize}
 
-\subsection{Bottom-up unsatisfiability aggregation}
+\subsection{Bottom-up unsatisfiability aggregation}\label{subsec:unsat}
 \begin{figure}[htbp]
   \centering
   \figorbox{fig3_aggregation.png}{Leaf $\to$ mid $\to$ replicated root EXHAUSTED\_REPORT aggregation.}
@@ -255,8 +256,31 @@ CPU-bound DFS periodically yields so inbound messages are served while computing
 
 \subsection{Module decomposition}
 \code{transport/} (I/O), \code{discovery/} (Kademlia), \code{gossip/} (epidemic spread),
-\code{tasks/} (split/dedup/lease/steal/aggregate), \code{solver/} (search), \code{peer.py}
-(orchestration), \code{cli.py} (demos + evaluation).
+\code{tasks/} (split/dedup/lease/steal/aggregate/\textbf{guards}), \code{solver/} (search),
+\code{peer.py} (orchestration), \code{cli.py} (demos + evaluation).
+
+\subsection{Task Guards: DHT-native non-exclusive coordination}\label{subsec:guards}
+The modes above still move task state over \emph{gossip} (\code{TASK\_CLAIM},
+\code{SPLIT\_REPORT}, \code{EXHAUSTED\_REPORT} are broadcast), which is high overhead at
+scale. The \emph{Task Guards} model (\code{--guard}, \code{tasks/guard.py}) adopts the
+traditional Kademlia methodology: a task is hashed to a key and stored (\code{PUT}) on its
+$k$ nearest peers --- its \textbf{guards} --- which hold a small tracking record
+$\{$state, holder, lease\_expire, children, children\_exhausted, parent\_id, ts$\}$ and
+coordinate \textbf{purely by point-to-point TCP} (\code{UPDATE\_STATUS}). A global gossip
+broadcast fires \emph{only} for the final \code{SOLUTION} / unsolvable verdict.
+
+An idle peer acts as a \emph{thief}: (i) cold-start \emph{Opt A} --- self-claim any
+\code{OPEN} task it already guards; else (ii) a random-key Kademlia lookup (parallel
+\code{FIND\_NODE}, $\alpha=3$) to the nearest active peer plus a direct \code{WORK\_STEAL}.
+On receiving a task it runs \code{sudoku\_search()} (BFS to \code{max\_split\_depth}),
+\code{PUT}s the child subtasks, \code{REPORT\_SPLIT}s to the parent's guards, and
+\emph{Opt B} instantly self-claims one child (zero idle time). Guards issue time-boxed
+leases and watch the thief's \code{HEARTBEAT}s. Resilience is comprehensive: a failed
+guard's record moves to the $(k{+}1)$-th nearest peer; a failed thief's lease expires and
+the task reverts to \code{OPEN}; a two-guard hand-out race is resolved deterministically by
+timestamps (earliest claim wins). Unsolvability uses the same bottom-up roll-up
+(\S\ref{subsec:unsat}) carried over guard \code{REPORT\_CHILD\_EXHAUSTED} RPCs instead of
+gossip.
 
 % ============================ IMPLEMENTATION ========================
 \section{Implementation}\label{sec:impl}
@@ -436,6 +460,14 @@ a \code{path} list of \code{[cell,val]} pairs. \code{SOLUTION}: a \code{board} f
 \code{SPLIT\_REPORT}: a task; \code{EXHAUSTED\_REPORT}: \code{parent\_id, child\_id}.
 \code{STATE\_SYNC}: \code{task\_id, frontier (list of paths), nodes}. \code{FIND\_NODE}:
 \code{target}; \code{FIND\_NODE\_REPLY}: \code{target, nodes(id/host/port), reply\_to}.
+
+\textbf{Task Guards RPCs} (\S\ref{subsec:guards}, point-to-point TCP).
+\code{WORK\_STEAL}: \code{host, port, reply\_to} (reply reuses \code{TASK\_OFFER} carrying the
+task or \code{null}). \code{UPDATE\_STATUS}: a full record \code{task\_id, path, parent\_id,
+state, holder, lease\_expire, children, children\_exhausted, ts}. \code{REPORT\_SPLIT}:
+\code{task\_id, path, parent\_id, children}. \code{REPORT\_EXHAUSTED}: \code{task\_id, path,
+parent\_id}. \code{REPORT\_CHILD\_EXHAUSTED}: \code{parent\_id, child\_id}. \code{HEARTBEAT}:
+\code{task\_id}.
 
 \section{Key algorithms (source locations)}
 Iterative lookup, the work-stealing deque loop, and bottom-up aggregation are implemented in

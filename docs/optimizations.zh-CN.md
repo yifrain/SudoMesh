@@ -450,6 +450,8 @@ stateDiagram-v2
 | 任务协调 | `TASK_CLAIM` / `TASK_DONE` | 现有 |
 | **任务拉取（优化一）** | `TASK_QUERY` / `TASK_OFFER` | **新增** |
 | **无解聚合（优化二）** | `SPLIT_REPORT` / `EXHAUSTED_REPORT` | **新增**（或复用 `TASK_DONE` + `kind`） |
+| **状态同步（崩溃恢复）** | `STATE_SYNC` | **新增** |
+| **Task Guards（优化四）** | `WORK_STEAL` / `UPDATE_STATUS` / `REPORT_SPLIT` / `REPORT_EXHAUSTED` / `REPORT_CHILD_EXHAUSTED` / `HEARTBEAT` | **新增**（见第 7 节） |
 | 发现 | `PING` / `PONG` / `FIND_NODE` / `FIND_NODE_REPLY` | 现有 |
 | 传播 | `GOSSIP_PUSH` | 现有 |
 
@@ -480,3 +482,103 @@ stateDiagram-v2
 | 完成任务后 | 需重新等待推送 | 拆分时自认领下一个，无缝衔接 |
 | 无解判定 | 无法判定 | `DONE_SPLIT/DONE_EXHAUSTED` 自底向上聚合，根任务确定性判定 |
 | 根节点 | 单点，崩溃即失能 | k 副本共同负责，抗崩溃 |
+
+---
+
+## 7. 优化四：Task Guards（Kademlia 原生的非独占模式）
+
+> 代码：[`tasks/guard.py`](../src/swarmsolve/tasks/guard.py)（`GuardStore`/`GuardRecord`），
+> [`peer.py`](../src/swarmsolve/peer.py) 中的 guard 模式；用 `--guard` 开启
+> （如 `swarmsolve demo --guard`、`swarmsolve unsolvable --guard`）。
+
+### 7.1 要解决的问题
+
+优化 1–3 仍然依赖 **gossip** 搬运任务状态（`TASK_CLAIM`、`SPLIT_REPORT`、
+`EXHAUSTED_REPORT` 都是广播）。规模上去后网络开销很高，还会引发重复探索：每个任务的
+状态都被全网知晓，而真正关心它的只有少数几个节点。
+
+### 7.2 策略：把任务存到它的 k 个 Guard 上
+
+不再把任务孤立地留在单个节点（朴素 XOR 放置），也不再 gossip 它的状态，而是采用
+**传统 Kademlia** 做法：任务被哈希成一个 key，**存储在 key 最近的 `k` 个节点上——即它的
+Task Guards**（`--guard-k`，默认 3）。
+
+Guard 维护一份小的跟踪记录，**所有状态同步都是 Guard 组内的点对点 TCP**，绝不 gossip。
+**只有**在找到合法解（或最终无解判定）时才触发一次全网 gossip 广播。
+
+```
+{ "task_id", "path", "state": OPEN|CLAIMED|DONE_SPLIT|DONE_EXHAUSTED,
+  "holder", "lease_expire", "children", "children_exhausted", "parent_id", "ts" }
+```
+
+### 7.3 主动工作窃取（thief 周期）
+
+```mermaid
+sequenceDiagram
+    participant Thief as 空闲节点（thief）
+    participant G as 某任务的 Guard
+    participant CG as 子任务的 Guards
+    Thief->>Thief: 冷启动 Opt A：本地是否守护着 OPEN 任务？有则自认领
+    Thief->>G: 随机 key 的 Kademlia 查找（alpha=3）-> 最近节点 -> WORK_STEAL
+    G->>G: try_claim(OPEN->CLAIMED, holder=thief, lease)
+    G-->>G: UPDATE_STATUS 同步给其余 k-1 个 Guard
+    G-->>Thief: TASK_OFFER（下发任务）
+    Thief->>Thief: sudoku_search() 按 BFS 展开到 max_split_depth
+    Thief->>CG: PUT 子任务 (T2..Tn) 为 OPEN
+    Thief->>G: REPORT_SPLIT（父任务 -> DONE_SPLIT + children）
+    Note over Thief: Opt B：立即自认领 T1 -> 零空闲
+    Thief->>G: 计算期间发送 HEARTBEAT 续租
+```
+
+1. **本地责任优先（冷启动 Opt A）。** 空闲节点在发起探测前，先检查自己是否守护着任何
+   `OPEN` 任务；若有则直接自认领执行，省去一次网络往返。这直接缓解冷启动阶段
+   `Peers ≫ Tasks` 的饥饿问题。
+2. **随机 key 窃取。** 否则生成一个随机 key，做一次 Kademlia 节点查找（并行 `FIND_NODE`，
+   α = 3）找到最近的活跃节点，再发起点对点 TCP `WORK_STEAL`。
+3. **租约。** Guard 把任务从 `OPEN → CLAIMED(holder, lease)`，同步给其余 Guard，然后下发；
+   之后通过 thief 的 `HEARTBEAT` 监控其存活，直到最终结果返回。
+4. **拆分并立即自认领（Opt B）。** thief 拿到任务后运行 `sudoku_search()`（BFS 到
+   `max_split_depth`），把子任务 `PUT` 到它们各自的 Guard，向父任务的 Guard 发
+   `REPORT_SPLIT`，并**立即自认领其中一个子任务**用于下一轮——只把*其余*子任务放进 DHT
+   供其他 thief 窃取。拆分后零 CPU 空闲（消除“拆分后再搜索”的空档）。
+
+### 7.4 任务结果
+
+* **求解成功。** thief 把解发给 Guard 校验；校验通过后全网 gossip，触发所有节点立即并行终止。
+* **死路。** thief 向该任务的 Guard 发 `REPORT_EXHAUSTED`；各 Guard 标记
+  `DONE_EXHAUSTED`，并把该 exhaustion 记到父任务名下（`REPORT_CHILD_EXHAUSTED`）。
+
+### 7.5 无解判定——自底向上的层级 exhaustion
+
+某个叶子分支被穷尽后，它的 Guard 向父任务的 Guard 发 `REPORT_CHILD_EXHAUSTED`，父任务
+`children_exhausted` 加一。当 `children_exhausted == len(children)` 时父任务自身变为
+`DONE_EXHAUSTED` 并再向上滚动一层（只有*主 Guard*——离 key 最近的那个——负责传播，避免
+`k²` 扩散）。当**根任务**（`parent_id == null`）被穷尽时，根 Guard 全网广播 `NO_SOLUTION`
+判定。这正是设计说明中的 6 步状态转移。
+
+### 7.6 容错与自愈
+
+| 故障 | 机制 |
+|------|------|
+| **Guard 失效** | 其余副本利用 DHT 路由找到 key 的下一个（第 `k+1` 近）节点，把记录迁移过去 |
+| **Thief 失效** | Guard 检测到租约过期（`expired_claims`），把 `CLAIMED → OPEN` 并 `UPDATE_STATUS` 同步给其余 Guard |
+| **竞争条件** | 两个 Guard 把同一任务派给不同 thief 时，用时间戳在 [`GuardStore.put`](../src/swarmsolve/tasks/guard.py) 中确定性裁决——**最早认领者胜**，落败方 abort；已完成状态不回退（单调推进） |
+
+### 7.7 RPC API（注册在 `transport/messages.py`）
+
+| 消息 | 方向 | 用途 |
+|------|------|------|
+| `WORK_STEAL` | thief → guard | 请求一个 OPEN 任务 |
+| `UPDATE_STATUS` | guard → 其余 k-1 guard | 同步任务记录（last-writer-wins） |
+| `REPORT_SPLIT` | thief → 任务 guards | 任务已展开成子任务（→ DONE_SPLIT） |
+| `REPORT_EXHAUSTED` | thief → 任务 guards | 叶子分支无效（→ DONE_EXHAUSTED） |
+| `REPORT_CHILD_EXHAUSTED` | 子 guards → 父 guards | 递归自底向上计数 |
+| `HEARTBEAT` | thief → guard | 续租，保持存活 |
+
+### 7.8 为什么更好，以及唯一的风险
+
+* **降低开销**——密集的状态同步被限制在 `k` 个 Guard 组内的点对点 TCP；只有最终解才全网 gossip。
+* **结构化间接存储**——任务管理原生融入 Kademlia DHT，工作窃取复用*同一套*并行结构化路由来定位目标。
+* **全面韧性**——Guard 失效、thief 失效、动态加入、去中心化负载均衡都被覆盖。
+* **风险——冷启动。** 早期 `Peers ≫ Tasks` 时，窃取常失败（联系到的节点大多还没任务）。
+  Opt A（本地自认领）+ Opt B（拆分后自认领）予以缓解，且随着搜索树分叉会自然消散。
