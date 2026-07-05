@@ -83,6 +83,9 @@ def _peer_worker(
             root_replicas=cfg.get("root_replicas", 3),
             steal=cfg.get("steal", False),
             sync_interval=cfg.get("sync_interval", 0.0),
+            guard=cfg.get("guard", False),
+            guard_k=cfg.get("guard_k", 3),
+            max_split_depth=cfg.get("max_split_depth", cfg.get("split_depth", 2)),
         )
         if cfg.get("report"):
             peer.on_tick = lambda snap, r=rank: q.put(("stat", r, snap))
@@ -217,13 +220,21 @@ def demo(
         0.0, help="Periodic state sync (s): busy peers snapshot their frontier to "
                   "backups for crash recovery (0 = off; needs --steal)"
     ),
+    guard: bool = typer.Option(
+        False, help="Task-Guards mode (Kademlia non-exclusive): tasks are stored on "
+                    "their k nearest peers (guards); idle peers random-key-lookup + "
+                    "WORK_STEAL; all state-sync is point-to-point TCP, gossip only for "
+                    "the final solution"
+    ),
+    guard_k: int = typer.Option(3, help="Replication factor k (guards per task)"),
     seed: int = typer.Option(0, help="RNG seed for generation"),
 ) -> None:
     """Run a real local P2P swarm and compare it to the single-machine baseline."""
     board = _load_or_generate(file, size, seed)
     target = tasks or (peers * 2)
     n = board.n
-    mode = "work-stealing deque" if steal else "gossip + re-split"
+    mode = ("task-guards" if guard
+            else "work-stealing deque" if steal else "gossip + re-split")
     console.print(f"[bold]Puzzle {n}x{n}, peers={peers}, node_delay={node_delay}s, "
                   f"split_depth={split_depth}, mode={mode}[/]")
     console.print(str(board))
@@ -238,7 +249,8 @@ def demo(
     cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
            "settle": 0.6, "report": False, "steal": steal,
            "probe_random": steal, "sync_interval": sync_interval,
-           "idle_limit": 60 if steal else 30}
+           "guard": guard, "guard_k": guard_k, "max_split_depth": split_depth,
+           "idle_limit": 60 if (steal or guard) else 30}
     procs, q = _spawn(peers, n, board.to_flat(), target, cfg)
     swarm_t0 = time.perf_counter()
     results = _collect(procs, q)
@@ -378,13 +390,19 @@ def unsolvable(
     node_delay: float = typer.Option(0.0, help="Per-node cost (s); demo knob"),
     split_depth: int = typer.Option(2, help="Tree split depth (more/smaller subtasks)"),
     lease: float = typer.Option(8.0, help="Task lease seconds"),
+    guard: bool = typer.Option(
+        False, help="Use Task-Guards mode: exhaustion is aggregated bottom-up via "
+                    "guard REPORT_CHILD_EXHAUSTED RPCs (point-to-point) instead of gossip"
+    ),
+    guard_k: int = typer.Option(3, help="Replication factor k (guards per task)"),
     seed: int = typer.Option(21, help="RNG seed for the generated unsolvable puzzle"),
 ) -> None:
     """Prove a puzzle has NO solution via hierarchical unsolvable detection.
 
     Peers split the tree, exhaust leaf branches, and report DONE_EXHAUSTED up to
     their parents; when the (replicated) root task becomes exhausted, the swarm
-    declares the puzzle unsolvable. Random-id probing helps idle peers pull work.
+    declares the puzzle unsolvable. In ``--guard`` mode this roll-up runs over the
+    Task-Guards point-to-point RPCs; otherwise it uses gossip.
     """
     board = load_board(file) if file else make_unsolvable(size, seed=seed, clue_ratio=0.30)
     n = board.n
@@ -402,8 +420,10 @@ def unsolvable(
 
     console.print("\n[bold]2) P2P swarm (bottom-up DONE_EXHAUSTED aggregation)[/]")
     cfg = {"lease": lease, "node_delay": node_delay, "split_depth": split_depth,
-           "settle": 0.5, "report": False, "detect_unsolvable": True,
-           "probe_random": True, "root_replicas": min(peers, 3), "idle_limit": 60}
+           "settle": 0.5, "report": False,
+           "detect_unsolvable": not guard, "probe_random": not guard,
+           "guard": guard, "guard_k": guard_k, "max_split_depth": split_depth,
+           "root_replicas": min(peers, 3), "idle_limit": 60}
     procs, q = _spawn(peers, n, board.to_flat(), peers * 4, cfg)
     swarm_t0 = time.perf_counter()
     results = _collect(procs, q)

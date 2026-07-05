@@ -9,7 +9,13 @@ Three *application* message types match the project brief:
     DEAD_END   -> an invalid branch that must not be re-explored
     SOLUTION   -> the final valid Sudoku solution
 
-Plus the *infrastructure* messages used by discovery / gossip.
+Plus the *infrastructure* messages used by discovery / gossip, and the
+**Task Guards** RPCs (Kademlia non-exclusive mode). Under the guard model a task
+is stored (PUT) on its ``k`` nearest peers, which act as *guards* tracking its
+state (OPEN / CLAIMED / DONE_SPLIT / DONE_EXHAUSTED). Guards coordinate purely by
+point-to-point TCP (``UPDATE_STATUS`` etc.) so state-sync traffic stays localized
+to the guard group; only the final ``SOLUTION`` / unsolvable verdict is gossiped
+network-wide.
 """
 
 from __future__ import annotations
@@ -37,6 +43,16 @@ class MessageType(str, Enum):
     EXHAUSTED_REPORT = "EXHAUSTED_REPORT"  # child->parent: "my branch is exhausted"
     # --- periodic state sync (crash recovery for work stealing) ---
     STATE_SYNC = "STATE_SYNC"      # owner->backups: snapshot of my unexplored frontier
+    # --- Task Guards (Kademlia non-exclusive mode; point-to-point TCP) ---
+    # A task is PUT on its k nearest peers ("guards") who track its state. All
+    # guard coordination is point-to-point TCP (no gossip) EXCEPT the final
+    # SOLUTION / unsolvable verdict, which is gossiped globally.
+    WORK_STEAL = "WORK_STEAL"                    # thief->guard: "give me an OPEN task"
+    UPDATE_STATUS = "UPDATE_STATUS"              # guard->other k-1 guards: sync a task's state
+    REPORT_SPLIT = "REPORT_SPLIT"                # thief->task guards: "I expanded it into children"
+    REPORT_EXHAUSTED = "REPORT_EXHAUSTED"        # thief->task guards: "this leaf branch is invalid"
+    REPORT_CHILD_EXHAUSTED = "REPORT_CHILD_EXHAUSTED"  # child guards->parent guards (recursive)
+    HEARTBEAT = "HEARTBEAT"                      # thief->guard: "still alive, keep the lease"
     # --- discovery (Kademlia over UDP) ---
     PING = "PING"
     PONG = "PONG"

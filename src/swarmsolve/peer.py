@@ -33,6 +33,14 @@ from swarmsolve.solver.search import (
     expand_subtasks,
     solve_subtree,
 )
+from swarmsolve.tasks.guard import (
+    CLAIMED,
+    DONE_EXHAUSTED,
+    DONE_SPLIT,
+    OPEN,
+    GuardRecord,
+    GuardStore,
+)
 from swarmsolve.tasks.scheduler import Scheduler
 from swarmsolve.tasks.task import Task, TaskStatus, path_repr
 from swarmsolve.transport.messages import Message, MessageType
@@ -63,6 +71,9 @@ class Peer:
         steal_yield_every: int = 64,
         steal_scan: int = 8,
         sync_interval: float = 0.0,
+        guard: bool = False,
+        guard_k: int = 3,
+        max_split_depth: int = 2,
         on_tick=None,
         tick_interval: float = 0.15,
     ) -> None:
@@ -74,6 +85,7 @@ class Peer:
         self.dht = KademliaNode(self.id, self.transport)
         self.gossip = Gossip(self.transport, self.dht.table)
         self.scheduler = Scheduler(self.id, lease_seconds=lease_seconds)
+        self.lease_seconds = lease_seconds
         self.log = log
         # Only *shallow* dead ends are worth sharing: deep leaf dead-ends are
         # too numerous and too specific to help other peers. This keeps gossip
@@ -138,6 +150,22 @@ class Peer:
         self._sync_last = 0.0
         self._current_task_id: str | None = None
 
+        # Task Guards (Kademlia non-exclusive mode). A task is PUT on its ``k``
+        # nearest peers, which track its state and coordinate purely by
+        # point-to-point TCP (UPDATE_STATUS etc.). Idle peers become *thieves*:
+        # they first self-claim any OPEN task they themselves guard (cold-start
+        # Opt A), else random-key lookup the nearest active peer and WORK_STEAL.
+        # On split they instant-self-claim one child (Opt B) -> zero idle time.
+        # Only the final SOLUTION / unsolvable verdict is gossiped globally.
+        self.guard = guard
+        self.guard_k = guard_k
+        self.max_split_depth = max_split_depth
+        self.guards = GuardStore(lease_seconds=lease_seconds)
+        self._guard_hb_last = 0.0
+        self.steals_ok = 0
+        self.steals_fail = 0
+        self._pending_steal: dict[str, asyncio.Future] = {}
+
         # Observability hook (used by the live dashboard).
         self.on_tick = on_tick
         self.tick_interval = tick_interval
@@ -183,6 +211,10 @@ class Peer:
                 "unsolvable": self.unsolvable,
             }
         )
+        if self.guard:
+            s.update(self.guards.stats())
+            s["steals_ok"] = self.steals_ok
+            s["steals_fail"] = self.steals_fail
         return s
 
     def _maybe_tick(self) -> None:
@@ -209,6 +241,17 @@ class Peer:
             MessageType.FIND_NODE_REPLY,
         ):
             await self.dht.handle(msg, addr)
+        elif msg.type in (
+            MessageType.WORK_STEAL,
+            MessageType.UPDATE_STATUS,
+            MessageType.REPORT_SPLIT,
+            MessageType.REPORT_EXHAUSTED,
+            MessageType.REPORT_CHILD_EXHAUSTED,
+            MessageType.HEARTBEAT,
+            MessageType.TASK_OFFER,
+        ) and self.guard:
+            # Task-Guards point-to-point coordination (never gossip re-forwarded).
+            await self._on_guard_msg(msg, addr)
         elif msg.type in (MessageType.TASK_QUERY, MessageType.TASK_OFFER):
             # point-to-point pull (not gossip): request/response, no re-forward
             await self._handle_pull(msg)
@@ -292,6 +335,9 @@ class Peer:
         return [Task(path=p) for p in frontier]
 
     async def submit(self, target_tasks: int) -> None:
+        if self.guard:
+            await self._guard_submit_root()
+            return
         if self.detect_unsolvable:
             await self._submit_root()
             return
@@ -483,6 +529,343 @@ class Peer:
         )
         self._stop.set()
 
+    # ================================================================== #
+    # Task Guards (Kademlia non-exclusive mode)
+    # ================================================================== #
+
+    def _guard_set(self, key: NodeID) -> list[Contact]:
+        """The ``k`` peers closest to ``key`` (guards), *including ourselves*."""
+        cand = list(self.dht.table.all_contacts()) + [self.contact()]
+        cand.sort(key=lambda c: xor_distance(c.node_id, key))
+        return cand[: self.guard_k]
+
+    def _i_am_guard(self, key: NodeID) -> bool:
+        return any(c.node_id == self.id for c in self._guard_set(key))
+
+    def _is_primary_guard(self, key: NodeID) -> bool:
+        """Am I the single closest guard to ``key`` (elects one propagator)?"""
+        gs = self._guard_set(key)
+        return bool(gs) and gs[0].node_id == self.id
+
+    async def _guard_broadcast(self, rec: GuardRecord) -> None:
+        """PUT / sync a guard record to the task's ``k`` guards (point-to-point).
+
+        Applies locally if we are a guard, and sends UPDATE_STATUS to the others.
+        This is the localized state-sync that replaces global gossip.
+        """
+        key = task_key(rec.task_id)
+        for c in self._guard_set(key):
+            if c.node_id == self.id:
+                self.guards.put(GuardRecord.from_dict(rec.to_dict()))
+            else:
+                await self.transport.send_tcp(
+                    c.host, c.port,
+                    Message(MessageType.UPDATE_STATUS, self.id.hex(),
+                            {"record": rec.to_dict()}, ttl=0),
+                )
+
+    async def _guard_send(self, key: NodeID, mtype: MessageType, payload: dict) -> None:
+        """Send a point-to-point message to all ``k`` guards of ``key``."""
+        for c in self._guard_set(key):
+            if c.node_id == self.id:
+                await self._on_guard_msg(
+                    Message(mtype, self.id.hex(), payload, ttl=0),
+                    (self.host, self.port),
+                )
+            else:
+                await self.transport.send_tcp(
+                    c.host, c.port, Message(mtype, self.id.hex(), payload, ttl=0)
+                )
+
+    # ---- submitter: seed the root + children into the DHT guards -------
+
+    async def _guard_submit_root(self) -> None:
+        children_paths = expand_subtasks(self.board, [])
+        if not children_paths:
+            # Root cannot branch: solved outright, or immediately contradictory.
+            result = solve_subtree(self.board, [], enumerate_all=True)
+            if result.stats.solutions > 0 and result.board is not None:
+                self.solution = result.board
+                self.solutions += result.stats.solutions
+                await self.gossip.broadcast(
+                    Message(MessageType.SOLUTION, self.id.hex(),
+                            {"board": result.board.to_flat()})
+                )
+            else:
+                await self._declare_unsolvable()
+            self._stop.set()
+            return
+        root = GuardRecord(task_id=path_repr([]), path=[], parent_id=None,
+                           state=DONE_SPLIT,
+                           children=[path_repr(p) for p in children_paths])
+        await self._guard_broadcast(root)  # root record -> root's guards
+        for p in children_paths:
+            child = GuardRecord(task_id=path_repr(p), path=list(p),
+                                parent_id=root.task_id, state=OPEN)
+            await self._guard_broadcast(child)  # each child -> its guards (OPEN)
+        self.log(f"[{self.id.short()}] guard-seeded root -> {len(children_paths)} "
+                 f"children across the DHT")
+
+    # ---- thief loop ---------------------------------------------------
+
+    async def _run_guard(self) -> Board | None:
+        idle = 0
+        self.log(f"[{self.id.short()}] guard/thief up, waiting for work...")
+        while not self._stop.is_set():
+            self._maybe_tick()
+            await self._guard_reclaim_expired()      # guard duty: watch leases
+            task = self._claim_local_open()          # cold-start Opt A
+            if task is None:
+                task = await self._steal_random()    # random-key work stealing
+            if task is None:
+                idle += 1
+                if self._bootstrap_contacts and idle % 30 == 0:
+                    await self.dht.bootstrap(self._bootstrap_contacts)
+                if idle > self.idle_limit:
+                    self.log(f"[{self.id.short()}] no work after {self.idle_limit} "
+                             f"polls, exiting")
+                    break
+                await asyncio.sleep(0.03)
+                continue
+            idle = 0
+            await self._process_guard_task(task)
+        self.log(f"[{self.id.short()}] stopping (nodes={self.nodes_expanded}, "
+                 f"tasks_done={self.tasks_done}, steals={self.steals_ok}/"
+                 f"{self.steals_ok + self.steals_fail})")
+        return self.solution
+
+    def _claim_local_open(self) -> Task | None:
+        """Cold-start Opt A: self-claim an OPEN task we already guard locally."""
+        now = time.time()
+        for rec in self.guards.open_records():
+            claimed = self.guards.try_claim(rec.task_id, self.id.hex(), now)
+            if claimed is not None:
+                asyncio.create_task(self._guard_broadcast(claimed))
+                return Task(path=list(rec.path), parent_id=rec.parent_id)
+        return None
+
+    async def _steal_random(self) -> Task | None:
+        """Random-key Kademlia lookup -> nearest active peer -> WORK_STEAL."""
+        target = NodeID.random()
+        try:
+            contacts = await self.dht.lookup(target)
+        except Exception:
+            contacts = self.dht.table.closest(target)
+        for c in contacts[:3]:
+            if c.node_id == self.id:
+                continue
+            req = Message(MessageType.WORK_STEAL, self.id.hex(),
+                          {"host": self.host, "port": self.port}, ttl=0)
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._pending_steal[req.msg_id] = fut
+            req.payload["reply_to"] = req.msg_id
+            ok = await self.transport.send_tcp(c.host, c.port, req)
+            if not ok:
+                self._pending_steal.pop(req.msg_id, None)
+                continue
+            try:
+                task_dict = await asyncio.wait_for(fut, timeout=1.0)
+            except asyncio.TimeoutError:
+                self._pending_steal.pop(req.msg_id, None)
+                continue
+            if task_dict:
+                self.steals_ok += 1
+                return Task(path=[tuple(a) for a in task_dict["path"]],
+                            parent_id=task_dict.get("parent_id"))
+        self.steals_fail += 1
+        return None
+
+    async def _process_guard_task(self, task: Task) -> None:
+        """Execute a stolen/claimed task: split (Opt B self-claim) or solve leaf."""
+        while task is not None and not self._stop.is_set():
+            self._current_task_id = task.id
+            tid = task.id
+            children_paths: list[Path] = []
+            if task.depth < self.max_split_depth:
+                children_paths = expand_subtasks(self.board, task.path)
+            if len(children_paths) > 1:
+                # Split T into children; PUT them to their guards.
+                child_tasks = [Task(path=p, parent_id=tid) for p in children_paths]
+                now = time.time()
+                for i, c in enumerate(child_tasks):
+                    if i == 0:
+                        # Opt B: instant self-claim child[0] -> zero idle time.
+                        rec = GuardRecord(task_id=c.id, path=list(c.path),
+                                          parent_id=tid, state=CLAIMED,
+                                          holder=self.id.hex(),
+                                          lease_expire=now + self.lease_seconds)
+                    else:
+                        rec = GuardRecord(task_id=c.id, path=list(c.path),
+                                          parent_id=tid, state=OPEN)
+                    await self._guard_broadcast(rec)
+                # report_split to T's guards (T -> DONE_SPLIT with children)
+                await self._guard_report_split(task, [c.id for c in child_tasks])
+                self.tasks_done += 1
+                task = child_tasks[0]        # continue on child[0], never idle
+                continue
+            # Leaf: exhaustively search the subtree.
+            result = solve_subtree(
+                self.board, task.path,
+                is_dead_end=self._is_dead_end,
+                record_dead_end=self._publish_dead_end,
+                should_stop=self._guard_should_stop,
+                node_delay=self.node_delay,
+                enumerate_all=True,
+            )
+            self.nodes_expanded += result.stats.nodes_expanded
+            self.solutions += result.stats.solutions
+            self.tasks_done += 1
+            if result.stats.solutions > 0 and result.board is not None:
+                # A. Solved -> gossip the solution globally to stop the swarm.
+                self.solution = result.board
+                self.log(f"[{self.id.short()}] FOUND solution "
+                         f"(explored {self.nodes_expanded} nodes)")
+                await self.gossip.broadcast(
+                    Message(MessageType.SOLUTION, self.id.hex(),
+                            {"board": result.board.to_flat()})
+                )
+                self._stop.set()
+                return
+            # B. Dead end -> report exhausted to this task's guards + parent tally.
+            await self._guard_report_exhausted(task)
+            return
+
+    def _guard_should_stop(self) -> bool:
+        self._maybe_tick()
+        now = time.monotonic()
+        if (self._current_task_id
+                and now - self._guard_hb_last > self.lease_seconds * 0.4):
+            self._guard_hb_last = now
+            asyncio.create_task(self._send_heartbeat(self._current_task_id))
+        return self._stop.is_set()
+
+    async def _send_heartbeat(self, task_id: str) -> None:
+        await self._guard_send(task_key(task_id), MessageType.HEARTBEAT,
+                               {"task_id": task_id})
+
+    # ---- thief -> guard reports --------------------------------------
+
+    async def _guard_report_split(self, task: Task, children_ids: list[str]) -> None:
+        await self._guard_send(
+            task.key, MessageType.REPORT_SPLIT,
+            {"task_id": task.id, "path": list(task.path),
+             "parent_id": task.parent_id, "children": children_ids},
+        )
+
+    async def _guard_report_exhausted(self, task: Task) -> None:
+        # Tell the task's own guards this branch is exhausted...
+        await self._guard_send(
+            task.key, MessageType.REPORT_EXHAUSTED,
+            {"task_id": task.id, "path": list(task.path),
+             "parent_id": task.parent_id},
+        )
+        # ...and tally it against the parent (bottom-up unsolvable detection).
+        if task.parent_id is None:
+            await self._declare_unsolvable()
+        else:
+            await self._guard_report_child_exhausted(task.parent_id, task.id)
+
+    async def _guard_report_child_exhausted(self, parent_id: str, child_id: str) -> None:
+        await self._guard_send(
+            task_key(parent_id), MessageType.REPORT_CHILD_EXHAUSTED,
+            {"parent_id": parent_id, "child_id": child_id},
+        )
+
+    # ---- guard duty: lease monitoring --------------------------------
+
+    async def _guard_reclaim_expired(self) -> None:
+        for rec in self.guards.expired_claims():
+            # Only the primary guard reverts (avoids duplicate reverts / races).
+            if self._is_primary_guard(task_key(rec.task_id)):
+                reverted = self.guards.revert_open(rec.task_id)
+                if reverted is not None:
+                    self.log(f"[{self.id.short()}] lease expired on "
+                             f"{rec.task_id[:16]}...; reverting to OPEN")
+                    await self._guard_broadcast(reverted)
+
+    # ---- guard inbound handlers --------------------------------------
+
+    async def _on_guard_msg(self, msg: Message, addr) -> None:
+        t = msg.type
+        if t == MessageType.WORK_STEAL:
+            await self._on_work_steal(msg)
+        elif t == MessageType.UPDATE_STATUS:
+            self.guards.apply_update(msg.payload["record"])
+        elif t == MessageType.REPORT_SPLIT:
+            self._on_report_split(msg)
+        elif t == MessageType.REPORT_EXHAUSTED:
+            self._on_report_exhausted(msg)
+        elif t == MessageType.REPORT_CHILD_EXHAUSTED:
+            await self._on_report_child_exhausted(msg)
+        elif t == MessageType.HEARTBEAT:
+            self.guards.renew(msg.payload["task_id"])
+        elif t == MessageType.TASK_OFFER:
+            self._on_steal_offer(msg)
+
+    async def _on_work_steal(self, msg: Message) -> None:
+        """A thief asks us (a guard) for work: hand out one OPEN task we hold."""
+        thief = msg.sender
+        host = msg.payload.get("host")
+        port = msg.payload.get("port")
+        reply_to = msg.payload.get("reply_to")
+        offered = None
+        for rec in self.guards.open_records():
+            claimed = self.guards.try_claim(rec.task_id, thief)
+            if claimed is not None:
+                await self._guard_broadcast(claimed)   # sync CLAIMED to co-guards
+                offered = {"path": list(rec.path), "parent_id": rec.parent_id}
+                break
+        if host and port:
+            await self.transport.send_tcp(
+                host, int(port),
+                Message(MessageType.TASK_OFFER, self.id.hex(),
+                        {"task": offered, "reply_to": reply_to}, ttl=0),
+            )
+
+    def _on_steal_offer(self, msg: Message) -> None:
+        reply_to = msg.payload.get("reply_to")
+        fut = self._pending_steal.pop(reply_to, None)
+        if fut is not None and not fut.done():
+            fut.set_result(msg.payload.get("task"))
+
+    def _on_report_split(self, msg: Message) -> None:
+        p = msg.payload
+        tid = p["task_id"]
+        if self.guards.get(tid) is None:
+            self.guards.put(GuardRecord(
+                task_id=tid, path=[tuple(a) for a in p.get("path", [])],
+                parent_id=p.get("parent_id"), state=DONE_SPLIT,
+                children=list(p.get("children", [])),
+            ))
+        else:
+            self.guards.mark_split(tid, list(p.get("children", [])))
+
+    def _on_report_exhausted(self, msg: Message) -> None:
+        p = msg.payload
+        tid = p["task_id"]
+        if self.guards.get(tid) is None:
+            self.guards.put(GuardRecord(
+                task_id=tid, path=[tuple(a) for a in p.get("path", [])],
+                parent_id=p.get("parent_id"), state=DONE_EXHAUSTED,
+            ))
+        else:
+            self.guards.mark_exhausted(tid)
+
+    async def _on_report_child_exhausted(self, msg: Message) -> None:
+        p = msg.payload
+        parent_id = p["parent_id"]
+        child_id = p["child_id"]
+        parent = self.guards.note_child_exhausted(parent_id, child_id)
+        if parent is None:
+            return  # not fully exhausted yet (or we don't hold this parent)
+        # Parent just became fully exhausted; the primary guard rolls it up.
+        if not self._is_primary_guard(task_key(parent_id)):
+            return
+        if parent.parent_id is None:
+            await self._declare_unsolvable()
+        else:
+            await self._guard_report_child_exhausted(parent.parent_id, parent_id)
+
     # ---- task selection ----------------------------------------------
 
     def _owner_of(self, task: Task) -> Contact | None:
@@ -556,6 +939,8 @@ class Peer:
         available for ``idle_limit`` consecutive polls — the idle window also
         gives a crashed peer's lease time to expire so its task is reclaimed.
         """
+        if self.guard:
+            return await self._run_guard()
         idle_rounds = 0
         self.log(f"[{self.id.short()}] waiting for tasks...")
         while not self._stop.is_set():
