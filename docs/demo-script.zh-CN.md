@@ -187,6 +187,52 @@ uv run swarmsolve unsolvable --peers 4 --split-depth 3
 
 **[亮点]**"自底向上 `DONE_EXHAUSTED` 聚合 + 根任务多副本消除了单点——无解结论在节点崩溃后依然成立。"
 
+### Task Guards — Kademlia 原生非独占模式（`--guard`）⭐ 旗舰
+
+**[说]**"最新的优化把任务管理**原生融入 Kademlia DHT**。每个任务被 `PUT` 到它 key 最近的 **k 个节点（guard）**上，由它们跟踪状态并**纯点对点 TCP 协调**。空闲节点用随机 key 查找最近的活跃节点并 `WORK_STEAL`，guard 在租约下派发一个 `OPEN` 任务。只有*最终解*才全网 gossip，密集的状态同步被限制在 k 个 guard 内，不再淹没全网。"
+
+**[跑]** 求解模式
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4 \
+    --guard --guard-k 3 --node-delay 0.0005 --split-depth 3
+```
+**[看]** 正确解出的棋盘；总结显示集群成功求解。
+
+**[跑]** 无解模式（经 guard RPC 自底向上判定）
+```bash
+uv run swarmsolve unsolvable --peers 4 --guard --split-depth 2
+```
+**[看]** `UNSOLVABLE`，`verdict matches single-machine baseline`。
+
+**[亮点]** 边指着 [`tasks/guard.py`](../src/swarmsolve/tasks/guard.py) 边点名四大机制：
+1. **冷启动 Opt A/B** — thief 先自认领自己守护的 `OPEN` 任务；拆分后立即自认领一个子任务（零空闲）。
+2. **租约 + 心跳** — thief 崩溃则租约过期、任务回退 `OPEN`；guard 崩溃则记录迁移到第 k+1 近节点。
+3. **竞争裁决** — 两个 guard 派发同一任务时，用时间戳在 `GuardStore.put` 中裁决（最早认领者胜）。
+4. **本地化同步** — `UPDATE_STATUS`/`REPORT_*` 是 k 个 guard 内的点对点消息；gossip 只留给最终 `SOLUTION`/`NO_SOLUTION`。
+
+---
+
+## 演示与 TU Dresden 评分标准 / 硬性要求的对应
+
+开场附近把这张表念出来——它告诉评委每条命令*佐证*了哪条要求。
+
+| 要求 / 评分维度 | 由什么体现 | 命令 |
+|-----------------|-----------|------|
+| **无中心权威**（完全去中心化） | 所有节点对等；任务放置/发现走 DHT，无调度器 | `demo --guard`、`peer`（多终端） |
+| **应用层自研 P2P 协议**（不用现成框架） | 手写 Kademlia（XOR/k桶/FIND_NODE）+ gossip + guard RPC，全在裸 asyncio TCP/UDP 上 | 走读 `discovery/`、`gossip/`、`tasks/guard.py` |
+| **自扩展**（任意节点数） | 加速比/效率随节点数上升 | `evaluate --suite scaling`；`benchmark --file wide.txt --peers 1,2,4` |
+| **故障容错 / 弹性** | 求解中途杀节点仍能完成；guard/thief 失效 + 租约回收 | `fault`；`evaluate --suite resilience` |
+| **公网可运行、无组播/广播** | 全部为到明确 `host:port` 的单播 TCP/UDP | `peer --bootstrap host:port` 跨机 |
+| **原创性** | DHT 键空间复用为任务 ID 空间 + Task-Guards 模型 | `demo --guard`、优化文档 §7 |
+| **技术复杂度** | Kademlia 路由、工作窃取、自底向上无解证明、guard 共识 | benchmark + unsolvable + guard 演示 |
+| **鲁棒性 / 完整性** | 38 个单测、解计数精确、判定与基线一致 | `uv run pytest -q` |
+| **汇报清晰度** | 实时仪表盘 + 图 + 本脚本流程 | `dashboard`、`docs/report.*` |
+
+**动态加入 / churn**（成员变化下的自扩展）：
+```bash
+uv run swarmsolve evaluate --suite churn --peers 6
+```
+
 ---
 
 ## 第 6 部分 — 设计权衡  *（主讲：A）*

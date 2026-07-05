@@ -220,6 +220,64 @@ matches single-machine baseline`.
 remove the single point of failure — the no-solution verdict survives node
 crashes."
 
+### Task Guards — Kademlia-native non-exclusive mode (`--guard`) ⭐ flagship
+
+**[Say]** "Our latest optimization makes task management *native to the Kademlia
+DHT*. Every task is stored (`PUT`) on its **k nearest peers — its guards** — which
+track its state and coordinate **purely by point-to-point TCP**. Idle peers
+random-key-lookup the nearest active peer and `WORK_STEAL`; a guard hands out an
+`OPEN` task under a lease. Only the *final solution* is gossiped network-wide, so
+the intensive state-sync traffic stays localized to k guards instead of flooding
+everyone."
+
+**[Run]** solve mode
+```bash
+uv run swarmsolve demo --file examples/puzzles/hard_9x9.txt --peers 4 \
+    --guard --guard-k 3 --node-delay 0.0005 --split-depth 3
+```
+**[Expect]** the correct solved grid; the summary shows the swarm solving it.
+
+**[Run]** unsolvable mode (bottom-up exhaustion over guard RPCs)
+```bash
+uv run swarmsolve unsolvable --peers 4 --guard --split-depth 2
+```
+**[Expect]** `UNSOLVABLE`, `verdict matches single-machine baseline`.
+
+**[Highlight]** name the four mechanisms as you point at the code
+([`tasks/guard.py`](../src/swarmsolve/tasks/guard.py)):
+1. **Cold-start Opt A/B** — a thief first self-claims any `OPEN` task it already
+   guards, and after a split instantly self-claims one child (zero idle time).
+2. **Leases + heartbeats** — a crashed thief's lease lapses and the task reverts
+   to `OPEN`; a crashed guard's record moves to the `k+1`-th nearest peer.
+3. **Race resolution** — two guards handing out the same task is settled by
+   timestamps (earliest claim wins) in `GuardStore.put`.
+4. **Localized sync** — `UPDATE_STATUS`/`REPORT_*` are point-to-point among k
+   guards; gossip is reserved for the final `SOLUTION`/`NO_SOLUTION` verdict.
+
+---
+
+## Mapping the demo to the TU Dresden grading criteria & hard requirements
+
+Say this table out loud near the start — it tells the examiners exactly which
+command *evidences* which requirement.
+
+| Requirement / criterion | Shown by | Command |
+|-------------------------|----------|---------|
+| **No central authority** (fully decentralized) | every peer is symmetric; task placement/discovery via the DHT, no coordinator | `demo --guard`, `peer` (multi-terminal) |
+| **Self-implemented app-layer P2P protocol** (no P2P framework) | hand-written Kademlia (XOR/k-buckets/FIND_NODE) + gossip + guard RPCs on raw asyncio TCP/UDP | code walk of `discovery/`, `gossip/`, `tasks/guard.py` |
+| **Self-scalability** (unbounded peers) | speedup/efficiency rise with peer count | `evaluate --suite scaling` ; `benchmark --file wide.txt --peers 1,2,4` |
+| **Fault tolerance / resilience** | kill a peer mid-solve, swarm still finishes; guard/thief failure + lease reclaim | `fault` ; `evaluate --suite resilience` |
+| **Runs on the public Internet, no multicast/broadcast** | all traffic is unicast TCP/UDP to explicit `host:port` | `peer --bootstrap host:port` across machines |
+| **Originality** | DHT keyspace reused as a task-ID space + Task-Guards model | `demo --guard`, optimizations §7 |
+| **Technical complexity** | Kademlia routing, work-stealing, bottom-up unsolvable proof, guard consensus | benchmark + unsolvable + guard demos |
+| **Robustness / completeness** | 38 unit tests, exact solution counts, verdict matches baseline | `uv run pytest -q` |
+| **Presentation clarity** | live dashboard + figures + this scripted flow | `dashboard`, `docs/report.*` |
+
+**Dynamic join / churn** (self-scalability under membership change):
+```bash
+uv run swarmsolve evaluate --suite churn --peers 6
+```
+
 ---
 
 ## Part 6 — Design trade-offs  *(owner: A)*
